@@ -1,0 +1,1 @@
+"""SlaClip minimal package."""

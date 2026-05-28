@@ -1,0 +1,3 @@
+Base Opacus repo (clean) used for overlay tests:
+- git describe: v1.5.4-21-gf17f254
+- git commit: f17f254ab8f1f1095e8257bf278769d549748bbc
