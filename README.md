@@ -2,70 +2,43 @@
 
 Official code for the ICML 2026 paper **“SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD.”**
 
-- **ICML Poster:** https://icml.cc/virtual/2026/poster/66390
+* **ICML Poster:** https://icml.cc/virtual/2026/poster/66390
 
-This repository is a self-contained overlay for the official [Opacus](https://github.com/pytorch/opacus) repository. It adds SlaClip and paper baselines without modifying upstream files. Remove `SlaClip/` to restore upstream behavior. It overlays the official Opacus repository without modifying upstream files in place.
+## Overview
+
+This repository provides a self-contained overlay for the official [Opacus](https://github.com/pytorch/opacus) repository. It adds SlaClip and the paper baselines without modifying upstream Opacus files in place. Removing the `SlaClip/` directory restores the upstream Opacus behavior.
+
 The main components are:
 
-- `run_exp.py`: unified experiment entry point
-- `slaclip/`: argument parsing, data loading, models, training loop, logging
-- `patches/opacus/`: patched `PrivacyEngine` and optimizer implementations
-- `tests/`: lightweight regression tests
-- `verify_install.py`: checks that the overlay is active
+* `run_exp.py`: unified experiment entry point
+* `slaclip/`: argument parsing, data loading, models, training loop, and logging
+* `patches/opacus/`: patched `PrivacyEngine` and optimizer implementations
+* `tests/`: lightweight regression tests
+* `verify_install.py`: checks that the overlay is active
+* `OPACUS_BASE_VERSION.txt`: records the Opacus version or commit used by this overlay
 
-## Quick start
-1. `git clone` the official Opacus repo, then copy this `SlaClip/` folder into the repo root. Run all commands from the opacus repo root (see Requirements).
-2. Create and activate a clean environment, then install dependencies (see Install).
-3. Run the CLI to reproduce experiments (default uses MNIST; you can switch datasets, models, and baselines).
-4. Interpreting results:
-   - `epsilon` is the privacy budget at the **last batch of each epoch**.
-   - `test_accuracy` is computed on the test set.
-   - The warning “Secure RNG turned off” means we use a faster non‑cryptographic RNG for convenience.
-     For strict paper‑grade runs, set `secure_mode=True` in `PrivacyEngine`.
-   - `_events.csv` records epsilon milestones at the first step where ε reaches or exceeds the target.
+## Quick Start
 
-## Requirements
-Install the Opacus repo directly from the source:
-```
+Clone the official Opacus repository and place this repository as `SlaClip/` under the Opacus root:
+
+```bash
 git clone https://github.com/pytorch/opacus.git
 cd opacus
+git clone https://github.com/ZsyRock/SlaClip.git SlaClip
 ```
-The Opacus version specified in `SlaClip/OPACUS_BASE_VERSION.txt`.
 
-## Install
-From the Opacus repo root:
-```
+Then create the environment, install Opacus in editable mode, and verify the overlay:
+
+```bash
 conda env create -f SlaClip/environment.yml
 conda activate opacus
 pip install -e .
 python SlaClip/verify_install.py
 ```
 
-Notes:
-- `environment.yml` installs PyTorch via pip. GPU support depends on installing CUDA wheels; if you get a CPU build, reinstall PyTorch with the CUDA wheel index, e.g.:
-  `pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio`
+To run a default SlaClip experiment on CIFAR-10:
 
-
-## Methods
-Use `--method` with one of:
-- `slaclip`
-- `slaclip-q`
-- `vanilla-clip`
-- `adap-clip`
-- `dc-sgd-e`
-- `autoclip`
-
-## Datasets
-Use `--dataset` with one of:
-- `mnist`
-- `fmnist`
-- `cifar10`
-- `imdb`
-- `names`
-
-## Default CLI (SlaClip-Cifar10)
-```
-
+```bash
 python SlaClip/run_exp.py \
   --dataset cifar10 \
   --method slaclip \
@@ -85,24 +58,124 @@ python SlaClip/run_exp.py \
   --target-epsilon 8 \
   --K 50 \
   --eta 0.2 \
-  --run-name cifar10_slaclip_sd42_bs2048_lr0.1_schedcos_C05_K50_eps8_sigma1.4157 \
-
+  --run-name cifar10_slaclip_sd42_bs2048_lr0.1_schedcos_C05_K50_eps8_sigma1.4157
 ```
 
-## Outputs
-Outputs are written to `SlaClip/outputs/`:
-- `<run_name>.csv` (epoch, epsilon, test_accuracy, C_t, dataset, method, seed)
-- `<run_name>.json` (same fields)
-- `<run_name>_events.csv` (epsilon milestones at: 0.1–0.9 step 0.1, then 1.0/1.5/2.0/2.5/3.0, then 4.0/5.0/6.0)
+## Requirements
 
-## Overlay details
-See `SlaClip/PATCH_MANIFEST.md`.
+Use the Opacus version or commit specified in:
+
+```text
+SlaClip/OPACUS_BASE_VERSION.txt
+```
+
+The environment file installs the required Python dependencies:
+
+```bash
+conda env create -f SlaClip/environment.yml
+conda activate opacus
+```
+
+Note: `environment.yml` installs PyTorch via pip. GPU support depends on the PyTorch wheel installed on your machine. If a CPU-only build is installed, reinstall PyTorch with the appropriate CUDA wheel index, for example:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+```
+
+## Installation Check
+
+After installing Opacus in editable mode, run:
+
+```bash
+pip install -e .
+python SlaClip/verify_install.py
+```
+
+The verification script checks whether the SlaClip overlay is active.
+
+## Methods
+
+Use `--method` with one of the following options:
+
+* `slaclip`
+* `slaclip-q`
+* `vanilla-clip`
+* `adap-clip`
+* `dc-sgd-e`
+* `autoclip`
+
+## Datasets
+
+Use `--dataset` with one of the following options:
+
+* `mnist`
+* `fmnist`
+* `cifar10`
+* `imdb`
+* `names`
+
+## Outputs
+
+Outputs are written to:
+
+```text
+SlaClip/outputs/
+```
+
+Each run produces:
+
+* `<run_name>.csv`: epoch-level results, including `epoch`, `epsilon`, `test_accuracy`, `C_t`, `dataset`, `method`, and `seed`
+* `<run_name>.json`: run configuration and result summary
+* `<run_name>_events.csv`: epsilon milestone events
+
+The `_events.csv` file records the first step at which ε reaches or exceeds each target milestone. The default milestones are:
+
+```text
+0.1, 0.2, ..., 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0
+```
+
+## Interpreting Results
+
+* `epsilon` is the privacy budget at the last batch of each epoch.
+* `test_accuracy` is computed on the test set.
+* `C_t` is the clipping threshold used by the method at the corresponding epoch.
+* The warning `Secure RNG turned off` means that a faster non-cryptographic random number generator is used for convenience. For strict paper-grade runs, set `secure_mode=True` in `PrivacyEngine`.
+
+## Tests
+
+Run the lightweight regression tests with:
+
+```bash
+pytest SlaClip/tests
+```
+
+## Overlay Details
+
+See:
+
+```text
+SlaClip/PATCH_MANIFEST.md
+```
+
+This file describes the Opacus components patched by the overlay.
 
 ## Citation
 
-This codebase is built as an overlay on top of the official Opacus repository.  
-If you use this repository, please also cite Opacus (see the Opacus README for the official BibTeX entry).
+If you use this code, please cite both the SlaClip paper and Opacus.
 
-- This overlay relies on the official Opacus package in the parent repository.
-- IMDB loading expects Hugging Face datasets/transformers support from the environment file.
-- `environment.yml` installs PyTorch from pip; adjust the CUDA wheel source if your machine needs a different build.
+```bibtex
+@inproceedings{TODO,
+  title     = {SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD},
+  author    = {TODO},
+  booktitle = {Proceedings of the International Conference on Machine Learning},
+  year      = {2026}
+}
+```
+
+This codebase is built as an overlay on top of the official Opacus repository. Please also cite Opacus; see the Opacus README for the official BibTeX entry.
+
+## Notes
+
+* This overlay relies on the official Opacus package in the parent repository.
+* IMDB loading expects Hugging Face `datasets` and `transformers` support from the environment file.
+* `environment.yml` installs PyTorch from pip; adjust the CUDA wheel source if your machine requires a different build.
