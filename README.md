@@ -1,20 +1,10 @@
-<p align="center">
-  <img src="slaclip_logo.png" width="180" alt="SlaClip logo">
-</p>
+<img src="slaclip_logo.png" align="right" width="140" alt="SlaClip logo">
 
-<h1 align="center">SlaClip</h1>
+# SlaClip
 
-<p align="center">
-  Official code for the ICML 2026 paper
-  <br>
-  <strong>“SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD.”</strong>
-</p>
+Official code for the ICML 2026 paper **“SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD.”**
 
-<p align="center">
-  <a href="https://icml.cc/virtual/2026/poster/66390">ICML Poster</a>
-</p>
-
----
+- **ICML Poster:** https://icml.cc/virtual/2026/poster/66390
 
 ## Overview
 
