@@ -1,4 +1,4 @@
-<img src="assets/slaclip_logo.png" align="right" width="120" alt="SlaClip logo">
+<img src="assets/slaclip_logo.png" align="right" width="100" alt="SlaClip logo">
 
 # SlaClip
 
