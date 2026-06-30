@@ -168,9 +168,9 @@ This file describes the Opacus components patched by the overlay.
 If you use this code, please cite both the SlaClip paper and Opacus.
 
 ```bibtex
-@inproceedings{TODO,
+@inproceedings{zou2026slaclip,
   title     = {SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD},
-  author    = {TODO},
+  author    = {Zou, Shuyan and Wang, Shaowei and Zhu, Zhanxing and Li, Jin and Dong, Changyu and Sassone, Vladimiro and Wu, Han},
   booktitle = {Proceedings of the International Conference on Machine Learning},
   year      = {2026}
 }
