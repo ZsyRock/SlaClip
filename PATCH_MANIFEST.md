@@ -13,8 +13,9 @@ SlaClip prepends `SlaClip/patches` to `sys.path` so patched modules load before 
 - `opacus/optimizers/__init__.py`
   - Extends optimizer package path and registers SlaClip/SlaClip-Q.
 
-- `opacus/optimizers/optimizer.py`
-  - Keeps the local optimizer overlay consistent with the upstream DPOptimizer interface used by the patched methods.
+- Upstream `opacus/optimizers/optimizer.py`
+  - Is deliberately **not** overlaid. All methods inherit the exact
+    `DPOptimizer` implementation from the pinned Opacus commit.
 
 - `opacus/optimizers/slaclipoptimizer.py`
   - Implements SlaClip with Opacus-consistent same-query release semantics under Poisson sampling.
@@ -27,3 +28,12 @@ SlaClip prepends `SlaClip/patches` to `sys.path` so patched modules load before 
 
 - `opacus/optimizers/DCSGDEOptimizer.py`
   - Implements the DC-SGD-E baseline under the shared Opacus optimizer interface.
+
+## Guardrails
+
+The patched `PrivacyEngine` rejects unsupported custom-method backends and
+distributed modes before installing model hooks, rejects unknown optimizer
+arguments in strict mode, keeps Poisson sampling aligned with the accountant,
+and never reuses an explicit gradient-noise generator as a sampler generator.
+Private controller checkpoints are accepted only at complete logical-query
+boundaries.

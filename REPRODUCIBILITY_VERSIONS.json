@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-08-02",
+  "paper": {
+    "title": "SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD",
+    "venue": "ICML 2026",
+    "source": "https://openreview.net/pdf?id=48suUeYKdb",
+    "camera_ready_pdf_sha256": "80a46bf0c71053bf72f8f969d963d762a6fcba4d41c37b530dd122914cb87d13",
+    "physical_pdf_pages": 22
+  },
+  "slaclip_upstream": {
+    "repository": "https://github.com/ZsyRock/SlaClip.git",
+    "base_commit": "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3",
+    "local_branch": "reproduction-faithful-20260802",
+    "release_tag": "slaclip-reproduction-v1",
+    "note": "The audited commit/tag is local and is not pushed by this repair task."
+  },
+  "opacus_upstream": {
+    "repository": "https://github.com/meta-pytorch/opacus.git",
+    "commit": "f17f254ab8f1f1095e8257bf278769d549748bbc",
+    "describe": "v1.5.4-21-gf17f254",
+    "local_packaging_branch": "slaclip-opacus-base",
+    "local_packaging_tag": "opacus-aug-slaclip-v1"
+  },
+  "declared_engineering_guardrails": {
+    "clip_norm_min": 0.1,
+    "clip_norm_max": 20.0,
+    "configurable_probability_min": 0.01,
+    "configurable_probability_max": 0.99,
+    "noisy_cdf_projection": [0.0, 1.0],
+    "note": "SlaClip Appendix C's noisy controller signal follows its [0,1] projection; only user-configurable probability parameters are restricted to [0.01,0.99]. AdaClip's noisy-fraction projection is a separately declared engineering guardrail."
+  },
+  "protocol_numerics": {
+    "main_noise_calibration_epsilon_tolerance": 1e-5,
+    "table2_regression_entries": 45,
+    "published_shared_grid_candidates": 16200,
+    "selected_method_dataset_budget_winners": 90,
+    "three_seed_retrain_commands": 270,
+    "main_k": "Eq. (14) floor using final calibrated sigma and actual logical release denominator",
+    "controlled_sigma1_k": "Appendix D/Table 3 practical values",
+    "selection_convention": "10% public stratified holdout, seed 2026; paper does not disclose these values",
+    "retrain_seeds": [42, 43, 44]
+  },
+  "environment": {
+    "python": "3.10.19",
+    "torch": "2.10.0+cu128",
+    "torchvision": "0.25.0+cu128",
+    "numpy": "2.2.6",
+    "datasets": "4.5.0",
+    "transformers": "5.1.0",
+    "pytest": "9.1.1"
+  },
+  "execution_guardrails": {
+    "default_max_physical_batch_vision": 64,
+    "default_max_physical_batch_text": 32,
+    "outputs_overwrite_by_default": false,
+    "private_training_metrics_published": false,
+    "experiments_or_dataset_downloads_performed_during_audit": false
+  },
+  "audit_verification": {
+    "slaclip_tests_passed": 153,
+    "table2_noise_entries_checked": 45,
+    "selected_opacus_upstream_tests_passed": 177,
+    "selected_opacus_upstream_tests_skipped_for_hardware": 12,
+    "selected_opacus_upstream_subtests_passed": 22,
+    "test_device": "CPU only",
+    "audit_virtual_environment_size": "24 MiB"
+  },
+  "data_provenance_limit": {
+    "paper_pins_imdb_huggingface_revision": false,
+    "paper_pins_names_archive_digest": false,
+    "runtime_recording": "IMDB tokenized split fingerprints and tokenizer vocabulary SHA-256; Names per-file and manifest SHA-256",
+    "claim": "No data-level bitwise reproduction claim is made without matching recorded fingerprints."
+  }
+}

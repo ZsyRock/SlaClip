@@ -1,171 +1,216 @@
-<h1>SlaClip</h1>
+# SlaClip audited reproduction overlay
 
-<img src="assets/slaclip_logo.png" align="right" width="110" alt="SlaClip logo">
+Official-code reproduction support for the ICML 2026 paper **“SlaClip:
+Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD.”**
 
-Official code for the ICML 2026 paper **“SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD.”**
+This directory is a versioned overlay inside an exact Opacus checkout. The
+audited local layout is:
 
-- **ICML Spotlight Poster:** https://icml.cc/virtual/2026/poster/66390
-
-<br clear="right"/>
-
-## Overview
-
-This repository provides a self-contained overlay for the official [Opacus](https://github.com/pytorch/opacus) repository. It adds SlaClip and the paper baselines without modifying upstream Opacus files in place. Removing the `SlaClip/` directory restores the upstream Opacus behavior.
-
-The main components are:
-
-* `run_exp.py`: unified experiment entry point
-* `slaclip/`: argument parsing, data loading, models, training loop, and logging
-* `patches/opacus/`: patched `PrivacyEngine` and optimizer implementations
-* `tests/`: lightweight regression tests
-* `verify_install.py`: checks that the overlay is active
-* `OPACUS_BASE_VERSION.txt`: records the Opacus version or commit used by this overlay
-
-## Quick Start
-
-Clone the official Opacus repository and place this repository as `SlaClip/` under the Opacus root:
-
-```bash
-git clone https://github.com/pytorch/opacus.git
-cd opacus
-git clone https://github.com/ZsyRock/SlaClip.git SlaClip
+```text
+Opacus-Aug/                         pinned Opacus base + packaging commit
+└── SlaClip/                        independently versioned reproduction overlay
+    ├── patches/opacus/             PrivacyEngine and paper optimizers
+    ├── slaclip/                    protocol, data, models, loop, logging
+    ├── tools/                      dry-run grid generation and selection
+    ├── tests/                      CPU regression/integration tests
+    ├── PAPER_FIDELITY.md           equation/guardrail/unknown audit
+    └── REPRODUCIBILITY_VERSIONS.json
 ```
 
-Then create the environment, install Opacus in editable mode, and verify the overlay:
+No dataset or training run is started by installation or verification.
+
+## Exact source versions
+
+The required Opacus base is:
+
+```text
+f17f254ab8f1f1095e8257bf278769d549748bbc
+v1.5.4-21-gf17f254
+```
+
+The audited SlaClip branch is based on upstream commit:
+
+```text
+d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3
+```
+
+The local reproduction commit and tags are recorded after audit in Git and in
+`REPRODUCIBILITY_VERSIONS.json`. They are local until explicitly pushed by the
+repository owner.
+
+To reconstruct the parent before applying the audited overlay:
 
 ```bash
+git clone https://github.com/meta-pytorch/opacus.git Opacus-Aug
+cd Opacus-Aug
+git checkout f17f254ab8f1f1095e8257bf278769d549748bbc
+git clone https://github.com/ZsyRock/SlaClip.git SlaClip
+cd SlaClip
+git checkout d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3
+```
+
+The local `Opacus-Aug` checkout already contains the audited overlay; do not
+repeat those clone commands there.
+
+## Environment and verification
+
+The pinned environment targets Python 3.10, PyTorch 2.10/CUDA 12.8, and
+torchvision 0.25:
+
+```bash
+cd Opacus-Aug
 conda env create -f SlaClip/environment.yml
 conda activate opacus
-pip install -e .
+python -m pip install --no-deps -e .
 python SlaClip/verify_install.py
+python -m pytest -q SlaClip/tests
 ```
 
-To run a default SlaClip experiment on CIFAR-10:
+`verify_install.py` checks both overlay resolution and that the parent history
+descends from the pinned Opacus base without changes to upstream Opacus code.
+
+For an existing compatible environment, a small virtual environment using its
+site packages is sufficient; avoid reinstalling multi-gigabyte CUDA wheels:
+
+```bash
+python -m venv --system-site-packages .venv
+.venv/bin/python -m pip install --no-deps -e .
+.venv/bin/python SlaClip/verify_install.py
+```
+
+## Paper protocols
+
+The runner fails on unknown arguments and distinguishes two protocols that use
+different privacy budgets.
+
+Controlled Appendix-F example (generates no work until this command is run):
 
 ```bash
 python SlaClip/run_exp.py \
-  --dataset cifar10 \
   --method slaclip \
+  --dataset cifar10 \
+  --protocol controlled \
+  --budget-index 1 \
   --seed 42 \
-  --epochs 90 \
-  --batch-size 2048 \
-  --batch-size-test 1024 \
-  --optim SGD \
-  --momentum 0.9 \
-  --weight-decay 5e-4 \
-  --grad-sample-mode hooks \
-  --delta 1e-5 \
+  --device cuda \
+  --run-name controlled-cifar10-slaclip-b1-s42
+```
+
+This fixes `sigma=1`, the controlled optimizer recipe, `C0=1`, SlaClip
+`eta=0.5`, and stops after the requested logical DP step reaches the relevant
+Appendix budget. For `sigma=1`, automatic K uses the practical values in
+Appendix D/Table 3.
+
+A single main-protocol selection candidate is:
+
+```bash
+python SlaClip/run_exp.py \
+  --method slaclip \
+  --dataset cifar10 \
+  --protocol main \
+  --phase selection \
+  --budget-index 1 \
+  --batch-size 512 \
   --lr 0.1 \
+  --C0 1 \
   --lr-schedule cos \
-  --C0 5 \
-  --sigma 1.415787 \
-  --target-epsilon 8 \
-  --K 50 \
-  --eta 0.2 \
-  --run-name cifar10_slaclip_sd42_bs2048_lr0.1_schedcos_C05_K50_eps8_sigma1.4157
+  --acknowledge-public-validation \
+  --device cuda \
+  --run-name main-select-slaclip-cifar10-example
 ```
 
-## Requirements
+Main runs calibrate sigma over the full prescribed horizon with tolerance
+`1e-5` (matching all 45 entries in Table 2 to three decimals). K is then chosen from Eq. (14)
+using the final sigma and actual logical release denominator. Do not pass
+`--sigma` or `--K` in the main protocol.
 
-Use the Opacus version or commit specified in:
+After validation selection, retrain the chosen candidate separately with seeds
+42, 43, and 44 using `--phase retrain`. Retraining restores the complete
+official training split and touches the test set only at the end.
 
-```text
-SlaClip/OPACUS_BASE_VERSION.txt
-```
+## Published shared grid
 
-The environment file installs the required Python dependencies:
+The paper publishes a shared grid of 16,200 candidates: six methods, five
+datasets, three budgets, six learning rates, three dataset-specific batch
+sizes, five C0 values, and two schedules. Generate manifests and shell commands
+without executing any experiment:
 
 ```bash
-conda env create -f SlaClip/environment.yml
-conda activate opacus
+python SlaClip/tools/generate_main_grid.py \
+  --output SlaClip/outputs/main_candidates.jsonl \
+  --commands-output SlaClip/outputs/main_commands.sh
 ```
 
-Note: `environment.yml` installs PyTorch via pip. GPU support depends on the PyTorch wheel installed on your machine. If a CPU-only build is installed, reinstall PyTorch with the appropriate CUDA wheel index, for example:
+After all candidate JSON files exist under
+`SlaClip/outputs/main_selection/`, validate the complete result set, select only
+by final validation accuracy, and generate 270 retrain commands (90
+method/dataset/budget winners, each retrained with three seeds):
 
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+python SlaClip/tools/select_main_grid.py \
+  --candidates SlaClip/outputs/main_candidates.jsonl \
+  --runs-dir SlaClip/outputs/main_selection \
+  --output SlaClip/outputs/main_retrains.jsonl \
+  --commands-output SlaClip/outputs/main_retrains.sh
 ```
 
-## Installation Check
+Both tools require clean, matching Git identities. The selector rejects missing
+candidates, mismatched configurations, dirty runs, incomplete horizons, and any
+selection-time test metric. The paper does not publish every method-specific
+adaptive-parameter range or the authors' selected configurations; those are
+recorded as underspecified rather than guessed.
 
-After installing Opacus in editable mode, run:
+## 8 GB GPU and storage safeguards
 
-```bash
-pip install -e .
-python SlaClip/verify_install.py
-```
+Private runs default to physical microbatches of 64 for vision and 32 for text.
+`BatchMemoryManager` accumulates them into the requested logical Poisson batch,
+so noise and the accountant advance once per logical batch. Reduce
+`--max-physical-batch-size` further if an 8 GB GPU still approaches OOM; this
+does not change logical B or q.
 
-The verification script checks whether the SlaClip overlay is active.
+Datasets, tokenized IMDB caches, environments, and outputs are Git-ignored.
+Names archive download/extraction has explicit compressed/uncompressed size,
+member-count, symlink, and path-traversal guards. Output files are never
+overwritten unless `--overwrite` is explicit. Check free space before running
+the full 16,200-candidate grid; the tools themselves only write small manifests.
 
-## Methods
+## Outputs and privacy boundary
 
-Use `--method` with one of the following options:
-
-* `slaclip`
-* `slaclip-q`
-* `vanilla-clip`
-* `adap-clip`
-* `dc-sgd-e`
-* `autoclip`
-
-## Datasets
-
-Use `--dataset` with one of the following options:
-
-* `mnist`
-* `fmnist`
-* `cifar10`
-* `imdb`
-* `names`
-
-## Outputs
-
-Outputs are written to:
+Each run writes exactly:
 
 ```text
-SlaClip/outputs/
+<run_name>.csv
+<run_name>.json
+<run_name>_config.json
 ```
 
-Each run produces:
+The records include arguments, protocol and split conventions, effective
+sampling rate, expected logical batch, sigma/K provenance, dependencies,
+device, both Git states, epsilon, C trajectory, and C-boundary hits.
 
-* `<run_name>.csv`: epoch-level results, including `epoch`, `epsilon`, `test_accuracy`, `C_t`, `dataset`, `method`, and `seed`
-* `<run_name>.json`: run configuration and result summary
-* `<run_name>_events.csv`: epsilon milestone events
+For private methods, raw training loss and accuracy are intentionally null/NaN:
+publishing them would be an additional unaccounted private query. Selection
+validation is an explicitly acknowledged public benchmark holdout; its 10%
+ratio and seed 2026 are deterministic conventions because the paper does not
+publish them. The per-command accountant does not compose privacy across a
+hyperparameter sweep.
 
-The `_events.csv` file records the first step at which ε reaches or exceeds each target milestone. The default milestones are:
+`secure_mode=False` matches the camera-ready numerical setting but is not a
+cryptographic deployment guarantee. A model intended to protect genuinely
+sensitive data must be retrained from the beginning with `--secure-mode` and a
+working `torchcsprng`; never silently fall back.
 
-```text
-0.1, 0.2, ..., 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0
-```
+## Fidelity status
 
-## Interpreting Results
-
-* `epsilon` is the privacy budget at the last batch of each epoch.
-* `test_accuracy` is computed on the test set.
-* `C_t` is the clipping threshold used by the method at the corresponding epoch.
-* The warning `Secure RNG turned off` means that a faster non-cryptographic random number generator is used for convenience. For strict paper-grade runs, set `secure_mode=True` in `PrivacyEngine`.
-
-## Tests
-
-Run the lightweight regression tests with:
-
-```bash
-pytest SlaClip/tests
-```
-
-## Overlay Details
-
-See:
-
-```text
-SlaClip/PATCH_MANIFEST.md
-```
-
-This file describes the Opacus components patched by the overlay.
+See `PAPER_FIDELITY.md` for the equation-exact (E), equivalent (Q), declared
+guardrail (G), and underspecified (U) matrix. The most important declared
+engineering bounds are C in `[0.1,20]` and configurable probabilities in
+`[0.01,0.99]`; SlaClip Appendix C's projection remains `[0,1]`. Adap-Clip's
+noisy-fraction projection is recorded separately as a DP-safe engineering
+guardrail. Guardrails are not silently treated as paper equations, and boundary
+activation is logged because it can affect utility.
 
 ## Citation
-
-If you use this code, please cite both the SlaClip paper and Opacus.
 
 ```bibtex
 @inproceedings{zou2026slaclip,
@@ -176,10 +221,5 @@ If you use this code, please cite both the SlaClip paper and Opacus.
 }
 ```
 
-This codebase is built as an overlay on top of the official Opacus repository. Please also cite Opacus; see the Opacus README for the official BibTeX entry.
-
-## Notes
-
-* This overlay relies on the official Opacus package in the parent repository.
-* IMDB loading expects Hugging Face `datasets` and `transformers` support from the environment file.
-* `environment.yml` installs PyTorch from pip; adjust the CUDA wheel source if your machine requires a different build.
+Please also cite Opacus and the original baseline papers when reporting those
+methods.

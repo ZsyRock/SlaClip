@@ -13,6 +13,8 @@ from .optimizer import DPOptimizer, _check_processed_flag, _generate_noise, _mar
 
 logger = logging.getLogger(__name__)
 
+_STATE_DICT_KEY = "_slaclip_controller_state"
+
 
 class _SlaClipBase(DPOptimizer):
 
@@ -31,9 +33,14 @@ class _SlaClipBase(DPOptimizer):
         beta: float = 0.5,
         gamma: float = 0.5,
         c_min: float = 0.1,
-        c_max: float = 50.0,
+        c_max: float = 20.0,
         strict_paper_check: bool = True,
     ):
+        if strict_paper_check and loss_reduction != "mean":
+            raise ValueError(
+                "strict_paper_check requires loss_reduction='mean' so the joint "
+                "release is the fixed-denominator average in Eq. (9)-(11)"
+            )
         super().__init__(
             optimizer,
             noise_multiplier=noise_multiplier,
@@ -51,12 +58,54 @@ class _SlaClipBase(DPOptimizer):
         self.beta = float(beta)
         self.gamma = float(gamma)
         self.strict_paper_check = bool(strict_paper_check)
-        self.current_clip = float(max_grad_norm)
         self.c_min = float(c_min)
         self.c_max = float(c_max)
-        self.slot_fb_ratio_min = 0.5
-        self.slot_fb_ratio_max = 2.0
-        self._EPS = 1e-6
+
+        if not math.isfinite(self.eta) or self.eta <= 0:
+            raise ValueError("eta must be finite and > 0")
+        if not math.isfinite(self.c_min) or self.c_min <= 0:
+            raise ValueError("c_min must be finite and > 0")
+        if not math.isfinite(self.c_max) or self.c_max < self.c_min:
+            raise ValueError("c_max must be finite and >= c_min")
+        if not math.isfinite(float(max_grad_norm)) or float(max_grad_norm) <= 0:
+            raise ValueError("max_grad_norm must be finite and > 0")
+        if not math.isfinite(self.beta) or not 0.01 <= self.beta <= 0.99:
+            raise ValueError("beta must be finite and in [0.01, 0.99]")
+        if not math.isfinite(self.gamma) or not 0.01 <= self.gamma <= 0.99:
+            raise ValueError("gamma must be finite and in [0.01, 0.99]")
+        if self.strict_paper_check and not math.isclose(
+            self.beta, 0.5, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "strict_paper_check requires beta=0.5, as fixed in Appendix C"
+            )
+        if self.strict_paper_check and not math.isclose(
+            self.gamma, 0.5, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "strict_paper_check requires gamma=0.5 for the published SlaClip-Q median"
+            )
+        if self.strict_paper_check and not (
+            math.isclose(self.c_min, 0.1, rel_tol=0.0, abs_tol=1e-12)
+            and math.isclose(self.c_max, 20.0, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ValueError(
+                "strict_paper_check requires the declared reproduction guardrails "
+                "c_min=0.1 and c_max=20.0"
+            )
+        if self.strict_paper_check and not (
+            self.c_min <= float(max_grad_norm) <= self.c_max
+        ):
+            raise ValueError(
+                "strict_paper_check requires max_grad_norm/C0 inside [0.1, 20.0]"
+            )
+
+        # C bounds are an explicit numerical guardrail used by the reproduction.
+        # Clamp C_0 as well as later thresholds so the invariant holds from step 0.
+        self.current_clip = float(
+            max(self.c_min, min(self.c_max, float(max_grad_norm)))
+        )
+        self.max_grad_norm = self.current_clip
 
         self._sample_count: int = 0
         self._slack_sum: Optional[torch.Tensor] = None
@@ -128,18 +177,21 @@ class _SlaClipBase(DPOptimizer):
                 if int(flat.shape[0]) != int(B):
                     raise ValueError("Inconsistent batch dimension across parameters")
 
-            g2 = flat.view(B, -1)
+            # ``flatten(start_dim=1)`` keeps the feature width well-defined for
+            # an empty Poisson batch, whereas ``view(0, -1)`` is ambiguous.
+            g2 = flat.flatten(start_dim=1)
             sum_sq = sum_sq + (g2 * g2).sum(dim=1)
 
-        batch_size = int(B) if B is not None else 0
-        if batch_size == 0:
-            for p, flat in flat_cache:
-                _mark_as_processed(p.grad_sample)
+        if B is None:
             return
+        batch_size = int(B)
 
         C_t = float(self.current_clip)
         eps = 1e-12
-        norms = torch.sqrt(sum_sq + eps)
+        # sqrt(0) is well-defined. Adding epsilon inside the square root would
+        # turn an exact zero gradient into norm 1e-6 and perturb the near-zero
+        # slack coordinate that drives Appendix C's controller.
+        norms = torch.sqrt(sum_sq)
 
         # Clip_{C_t}(g) = g * min(1, C_t / (||g||_2 + 1e-12))
         clip_factor = (C_t / (norms + eps)).clamp(max=1.0)
@@ -171,24 +223,18 @@ class _SlaClipBase(DPOptimizer):
             self._slack_sum += batch_slack_sum
         self._sample_count += batch_size
 
-    def _compute_slack_indicator(self, C_t: float) -> Optional[torch.Tensor]:
-        if self._slack_sum is None:
-            return None
-        if self._lambda_t <= 0:
-            return None
-
-        noise = _generate_noise(
-            std=self.noise_multiplier * C_t,
-            reference=self._slack_sum,
-            generator=self.generator,
-            secure_mode=self.secure_mode,
-        )
-        slack_noisy_sum = self._slack_sum + noise
-        s_hat = slack_noisy_sum / (self._lambda_t * self._release_denom())
-        return s_hat
-
     def _update_threshold(self, C_t: float, s_hat: torch.Tensor) -> float:
         raise NotImplementedError
+
+    def _bounded_threshold_update(self, C_t: float, exponent: float) -> float:
+        """Compute ``clip(C_t * exp(exponent), c_min, c_max)`` safely."""
+        upper_exponent = math.log(self.c_max / C_t)
+        lower_exponent = math.log(self.c_min / C_t)
+        if exponent >= upper_exponent:
+            return self.c_max
+        if exponent <= lower_exponent:
+            return self.c_min
+        return float(C_t * math.exp(exponent))
 
     def add_noise(self):
         C_t = float(self.current_clip)
@@ -251,24 +297,117 @@ class _SlaClipBase(DPOptimizer):
             self.current_clip = float(C_next)
             self.max_grad_norm = float(C_next)
 
+    def state_dict(self):
+        """Save wrapped-optimizer and SlaClip controller state.
+
+        Opacus does not serialize an in-flight virtual batch's ``summed_grad``.
+        Refuse such checkpoints instead of producing a state that cannot resume
+        the same logical DP-SGD step.
+        """
+        if self._is_last_step_skipped or self._has_unprocessed_private_state():
+            raise RuntimeError(
+                "Cannot checkpoint SlaClip with an unfinished private query; finish "
+                "backward and all physical microbatches through optimizer.step() first."
+            )
+
+        state = super().state_dict()
+        state[_STATE_DICT_KEY] = {
+            "version": 1,
+            "optimizer_class": type(self).__name__,
+            "current_clip": float(self.current_clip),
+            "K": int(self.K),
+            "eta": float(self.eta),
+            "beta": float(self.beta),
+            "gamma": float(self.gamma),
+            "c_min": float(self.c_min),
+            "c_max": float(self.c_max),
+            "strict_paper_check": bool(self.strict_paper_check),
+        }
+        return state
+
+    def _has_unprocessed_private_state(self) -> bool:
+        """Detect a backward/clip result that has not completed its DP release."""
+        for parameter in self.params:
+            for attribute in ("grad_sample", "summed_grad"):
+                value = getattr(parameter, attribute, None)
+                tensors = value if isinstance(value, list) else [value]
+                if any(
+                    isinstance(tensor, torch.Tensor)
+                    and not hasattr(tensor, "_processed")
+                    for tensor in tensors
+                ):
+                    return True
+        return False
+
+    def load_state_dict(self, state_dict) -> None:
+        """Restore a logical-step-boundary SlaClip checkpoint."""
+        controller_state = state_dict.get(_STATE_DICT_KEY)
+        optimizer_state = {
+            key: value for key, value in state_dict.items() if key != _STATE_DICT_KEY
+        }
+        super().load_state_dict(optimizer_state)
+
+        # Backwards compatibility for checkpoints made before controller state
+        # was added: keep the constructor-provided clipping configuration.
+        if controller_state is None:
+            return
+        if int(controller_state.get("version", -1)) != 1:
+            raise ValueError("Unsupported SlaClip controller checkpoint version")
+        if controller_state.get("optimizer_class") != type(self).__name__:
+            raise ValueError("SlaClip checkpoint optimizer class does not match")
+
+        expected_configuration = {
+            "K": int(self.K),
+            "eta": float(self.eta),
+            "beta": float(self.beta),
+            "gamma": float(self.gamma),
+            "c_min": float(self.c_min),
+            "c_max": float(self.c_max),
+            "strict_paper_check": bool(self.strict_paper_check),
+        }
+        for key, expected in expected_configuration.items():
+            if controller_state.get(key) != expected:
+                raise ValueError(
+                    f"SlaClip checkpoint configuration mismatch for {key}: "
+                    f"checkpoint={controller_state.get(key)!r}, current={expected!r}"
+                )
+
+        restored_clip = float(controller_state["current_clip"])
+        if not (
+            math.isfinite(restored_clip)
+            and self.c_min <= restored_clip <= self.c_max
+        ):
+            raise ValueError(
+                "SlaClip checkpoint current_clip lies outside configured bounds"
+            )
+
+        self.current_clip = restored_clip
+        self.max_grad_norm = restored_clip
+        self._sample_count = 0
+        self._slack_sum = None
+        self._lambda_t = 0.0
+        self._slack_indicator = None
+
 
 class SlaClipOptimizer(_SlaClipBase):
 
     def _update_threshold(self, C_t: float, s_hat: torch.Tensor) -> float:
-        # DefiClip slot_feedback update
+        # Full SlaClip adaptive-threshold update.
         if self.strict_paper_check:
             if s_hat.numel() != int(self.K):
                 raise ValueError("strict_paper_check: slack_indicator length != K")
-        q_hat = float(s_hat[0].item())
-        r_hat = float(s_hat[int(self.K) - 1].item())
+        s_first = float(s_hat[0].item())
+        s_last = float(s_hat[int(self.K) - 1].item())
 
-        z_t = r_hat / (C_t + self._EPS)
-        gamma_t = 1.0 - self.beta * (1.0 - z_t)
+        # Appendix C, Eqs. (28)-(30): first clip the normalized last slot,
+        # then map it to gamma_t. In paper mode the coefficient is fixed at 1/2.
+        r_t = float(max(0.0, min(1.0, s_last / C_t)))
+        feedback_weight = 0.5 if self.strict_paper_check else self.beta
+        gamma_t = 1.0 - feedback_weight * (1.0 - r_t)
         gamma_t = float(max(0.0, min(1.0, gamma_t)))
 
-        step = self.eta * (gamma_t - q_hat)
-        C_next = float(C_t * math.exp(step))
-        return float(max(self.c_min, min(self.c_max, C_next)))
+        exponent = self.eta * (gamma_t - s_first)
+        return self._bounded_threshold_update(C_t, exponent)
 
 
 class SlaClipQOptimizer(_SlaClipBase):
@@ -276,5 +415,5 @@ class SlaClipQOptimizer(_SlaClipBase):
     def _update_threshold(self, C_t: float, s_hat: torch.Tensor) -> float:
         s1 = float(s_hat[0].item())
         # Eq. (12): C_{t+1} = C_t * exp( eta * ( gamma - s1 ) )
-        C_next = float(C_t * math.exp(self.eta * (self.gamma - s1)))
-        return float(max(self.c_min, min(self.c_max, C_next)))
+        exponent = self.eta * (self.gamma - s1)
+        return self._bounded_threshold_update(C_t, exponent)

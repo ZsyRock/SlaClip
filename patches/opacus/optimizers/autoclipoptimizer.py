@@ -6,6 +6,11 @@ import torch
 
 from .optimizer import DPOptimizer, _check_processed_flag, _mark_as_processed
 
+_EXPERIMENT_C_MIN = 0.1
+_EXPERIMENT_C_MAX = 20.0
+_PERCENTAGE_MIN = 0.01
+_PERCENTAGE_MAX = 0.99
+
 
 class AutoClipDPOptimizer(DPOptimizer):
     """
@@ -40,6 +45,16 @@ class AutoClipDPOptimizer(DPOptimizer):
             R = float(max_grad_norm[0]) if len(max_grad_norm) > 0 else 1.0
         else:
             R = float(max_grad_norm)
+
+        if R <= 0:
+            raise ValueError("AutoClip sensitivity radius R must be > 0.")
+        if not (_EXPERIMENT_C_MIN <= R <= _EXPERIMENT_C_MAX):
+            raise ValueError("AutoClip sensitivity radius R must be in [0.1, 20.0].")
+
+        if not (_PERCENTAGE_MIN <= float(autoclip_q) <= _PERCENTAGE_MAX):
+            raise ValueError("autoclip_q must be in [0.01, 0.99].")
+        if not (_PERCENTAGE_MIN <= float(ema_beta) <= _PERCENTAGE_MAX):
+            raise ValueError("ema_beta must be in [0.01, 0.99].")
 
         super().__init__(
             optimizer=optimizer,

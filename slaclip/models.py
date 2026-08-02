@@ -50,34 +50,33 @@ class LeNetCNN(nn.Module):
 
 class IMDBDeepAveragingMLP(nn.Module):
 
-    def __init__(self, vocab_size: int):
+    def __init__(self, vocab_size: int, pad_id: int = 0):
         super().__init__()
-        self.emb = nn.Embedding(vocab_size, 16)
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.pad_id = int(pad_id)
+        self.emb = nn.Embedding(vocab_size, 16, padding_idx=self.pad_id)
         self.fc1 = nn.Linear(16, 16)
         self.fc2 = nn.Linear(16, 2)
 
     def forward(self, x):
-        x = self.emb(x)
-        x = x.transpose(1, 2)
-        x = self.pool(x).squeeze(-1)
-        x = self.fc1(x)
-        x = nn.functional.relu(x)
-        x = self.fc2(x)
-        return x
+        if x.dim() != 2:
+            raise ValueError(f"Expected token ids with shape [B,T], got {tuple(x.shape)}")
+        mask = x.ne(self.pad_id).unsqueeze(-1)
+        embedded = self.emb(x)
+        token_sum = (embedded * mask).sum(dim=1)
+        token_count = mask.sum(dim=1).clamp(min=1).to(embedded.dtype)
+        pooled = token_sum / token_count
+        return self.fc2(nn.functional.relu(self.fc1(pooled)))
 
 
 def _get_dp_rnn_layer(rnn_arch: str):
     rnn_arch = str(rnn_arch).lower().strip()
-    try:
-        from opacus.layers import DPLSTM, DPGRU
-        if rnn_arch == "gru":
-            return DPGRU
+    from opacus.layers import DPLSTM, DPGRU
+
+    if rnn_arch == "gru":
+        return DPGRU
+    if rnn_arch == "lstm":
         return DPLSTM
-    except Exception:
-        if rnn_arch == "gru":
-            return nn.GRU
-        return nn.LSTM
+    raise ValueError(f"Unsupported DP-RNN architecture: {rnn_arch}")
 
 
 class NamesCharDPLSTM(nn.Module):
@@ -135,7 +134,10 @@ def make_model(dataset: str, num_classes: int, meta: dict, args) -> nn.Module:
     if ds in {"mnist", "fmnist"}:
         return LeNetCNN(num_classes=num_classes)
     if ds == "imdb":
-        return IMDBDeepAveragingMLP(vocab_size=int(meta["vocab_size"]))
+        return IMDBDeepAveragingMLP(
+            vocab_size=int(meta["vocab_size"]),
+            pad_id=int(meta.get("pad_token_id", meta.get("pad_id", 0))),
+        )
     if ds == "names":
         return NamesCharDPLSTM(
             vocab_size=int(meta["vocab_size"]),

@@ -33,12 +33,17 @@ logger = logging.getLogger(__name__)
 
 _MIN_STRIDE_ABS = 1e-12
 _MIN_STRIDE_REL = 1e-6  # relative to current clipping norm
-_MIN_CLIP = 1e-8       # floor for max_grad_norm to avoid collapsing to zero
+_EXPERIMENT_C_MIN = 0.1
+_EXPERIMENT_C_MAX = 20.0
+_PERCENTILE_MIN = 0.01
+_PERCENTILE_MAX = 0.99
+_DEFAULT_MAX_BOUNDARY_SEARCH_ITERATIONS = 32
+_STATE_DICT_KEY = "_slaclip_dcsgde_state"
 
 
 class DCSGDEOptimizer(DPOptimizer):
     """
-    DC-SGD: Differentially Private SGD with Dynamic Clipping through Gradient Norm Distribution Estimation 
+    DC-SGD: Differentially Private SGD with Dynamic Clipping through Gradient Norm Distribution Estimation
     Paper: https://arxiv.org/abs/2503.22988
     """
 
@@ -46,8 +51,8 @@ class DCSGDEOptimizer(DPOptimizer):
         self,
         optimizer: Optimizer,
         *,
-        noise_multiplier: float,          # sigma_total (what user passes / what accountant must see)
-        histogram_std: float = 6.0,       # sigma_hist
+        noise_multiplier: float,  # sigma_total (what user passes / what accountant must see)
+        histogram_std: float = 6.0,  # sigma_hist
         max_grad_norm: float,
         expected_batch_size: Optional[int],
         loss_reduction: str = "mean",
@@ -55,11 +60,12 @@ class DCSGDEOptimizer(DPOptimizer):
         secure_mode: bool = False,
         batchsize_train: int = 256,
         dimension: int = 11181642,
-        percentile: float = 0.3,          # kept for API compatibility
+        percentile: float = 0.3,  # kept for API compatibility
         stride: float = 1.0,
         bin_cnt: int = 20,
         c_min: Optional[float] = None,
         c_max: Optional[float] = None,
+        max_boundary_search_iterations: int = _DEFAULT_MAX_BOUNDARY_SEARCH_ITERATIONS,
         **kwargs,
     ):
         # --- validate ---
@@ -69,8 +75,8 @@ class DCSGDEOptimizer(DPOptimizer):
             raise ValueError("noise_multiplier must be >= 0.")
         if sigma_hist <= 0:
             raise ValueError("histogram_std must be > 0.")
-        if float(max_grad_norm) <= 0:
-            raise ValueError("max_grad_norm must be > 0.")
+        if not (_EXPERIMENT_C_MIN <= float(max_grad_norm) <= _EXPERIMENT_C_MAX):
+            raise ValueError("max_grad_norm must be in [0.1, 20.0].")
         if loss_reduction not in ("mean", "sum"):
             raise ValueError(f"Unexpected loss_reduction: {loss_reduction}")
 
@@ -92,20 +98,24 @@ class DCSGDEOptimizer(DPOptimizer):
             sigma_grad = inv_grad ** (-0.5)
 
         # Save both:
-        self._accountant_noise_multiplier = sigma_total   # what accountant must see
-        self._grad_noise_multiplier = float(sigma_grad)   # what we use in add_noise
-        self.historgram_std = sigma_hist                  # keep original typo name used by old code
-        self.histogram_std = sigma_hist                   # and a correct alias
+        self._accountant_noise_multiplier = sigma_total  # what accountant must see
+        self._grad_noise_multiplier = float(sigma_grad)  # what we use in add_noise
+        self.historgram_std = sigma_hist  # keep original typo name used by old code
+        self.histogram_std = sigma_hist  # and a correct alias
 
         # clip bounds (optional)
-        self.c_min = float(c_min) if c_min is not None else _MIN_CLIP
-        self.c_max = float(c_max) if c_max is not None else float("inf")
-        if not (self.c_min > 0):
-            self.c_min = _MIN_CLIP
-        if not math.isfinite(self.c_max) or self.c_max <= 0:
-            self.c_max = float("inf")
+        self.c_min = float(c_min) if c_min is not None else _EXPERIMENT_C_MIN
+        self.c_max = float(c_max) if c_max is not None else _EXPERIMENT_C_MAX
+        if not (_EXPERIMENT_C_MIN <= self.c_min <= _EXPERIMENT_C_MAX):
+            raise ValueError("c_min must be in [0.1, 20.0] for DCSGDE.")
+        if not (_EXPERIMENT_C_MIN <= self.c_max <= _EXPERIMENT_C_MAX):
+            raise ValueError("c_max must be in [0.1, 20.0] for DCSGDE.")
         if self.c_max < self.c_min:
-            raise ValueError(f"c_max ({self.c_max}) must be >= c_min ({self.c_min}) for DCSGDE")
+            raise ValueError(
+                f"c_max ({self.c_max}) must be >= c_min ({self.c_min}) for DCSGDE"
+            )
+        if not (self.c_min <= float(max_grad_norm) <= self.c_max):
+            raise ValueError("max_grad_norm must lie inside [c_min, c_max] for DCSGDE.")
 
         # Initialize DPOptimizer with sigma_total so step_hook reads correct sigma
         super().__init__(
@@ -128,15 +138,27 @@ class DCSGDEOptimizer(DPOptimizer):
 
         # Prefer a sensible default if user didn't pass batchsize_train
         if int(batchsize_train) <= 0:
-            batchsize_train = int(expected_batch_size) if expected_batch_size is not None else 1
+            batchsize_train = (
+                int(expected_batch_size) if expected_batch_size is not None else 1
+            )
 
         self.batchsize_train = int(batchsize_train)
         self.dimension = int(dimension)
         self.percentile = float(percentile)
+        if not (_PERCENTILE_MIN <= self.percentile <= _PERCENTILE_MAX):
+            raise ValueError("percentile must be in [0.01, 0.99].")
 
         self.timer = 0
         self.stride = float(stride)
         self.bin_cnt = int(bin_cnt)
+        if self.stride <= 0:
+            raise ValueError("stride must be > 0.")
+        if self.bin_cnt <= 0:
+            raise ValueError("bin_cnt must be a positive integer.")
+        self.max_boundary_search_iterations = int(max_boundary_search_iterations)
+        if self.max_boundary_search_iterations <= 0:
+            raise ValueError("max_boundary_search_iterations must be positive.")
+        self._last_boundary_search_iterations = 0
 
         self.stride = max(self.stride, self._get_stride_floor())
         self.max_grad_norm = self._clamp_C(float(self.max_grad_norm))
@@ -145,6 +167,7 @@ class DCSGDEOptimizer(DPOptimizer):
         self.sample_size = 0
         self.unclipped_num = 0
         self.norm_stack: list[float] = []
+        self._histogram_query_pending = False
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
@@ -194,10 +217,11 @@ class DCSGDEOptimizer(DPOptimizer):
         bin_cnt = int(self.bin_cnt)
         self.timer += 1
 
-        if len(self.norm_stack) == 0:
-            return
-
-        # Build histogram on CPU (norm_stack are python floats)
+        # Build the query even for an empty Poisson batch. Branching on the raw
+        # realized batch size would expose a private sampling event through the
+        # threshold trajectory. A zero histogram plus Gaussian noise follows the
+        # same accounted mechanism and makes the subsequent branch DP
+        # post-processing.
         hist = [0.0 for _ in range(bin_cnt)]
         for tmp in self.norm_stack:
             if not math.isfinite(tmp):
@@ -220,11 +244,18 @@ class DCSGDEOptimizer(DPOptimizer):
         # Numerical guard: if noise_sum is degenerate, skip update
         if not (noise_sum > 0.0):
             self.norm_stack = []
+            self._histogram_query_pending = False
             return
 
-        # Search best_cb among {0.1C, 0.2C, ..., 2.0C} (same as author code)
+        # Search best_cb among {0.1C, 0.2C, ..., 2.0C} (same as author code).
+        # The paper/author implementation expands the search again when the minimizer
+        # is on a boundary. A hard experiment range makes an unbounded while-loop
+        # unsafe, so stop once the bound prevents further expansion, or after the
+        # explicit iteration cap and keep the best candidate from the last search.
         best_cb = float(self.max_grad_norm)
-        while True:
+        self._last_boundary_search_iterations = 0
+        for search_iteration in range(1, self.max_boundary_search_iterations + 1):
+            self._last_boundary_search_iterations = search_iteration
             mins = float("inf")
             C_cur = float(self.max_grad_norm)
 
@@ -250,12 +281,27 @@ class DCSGDEOptimizer(DPOptimizer):
                     mins = expect
                     best_cb = cb
 
-            # Keep the original "boundary re-search" behavior
-            if best_cb != 2.0 * C_cur and best_cb != 0.1 * C_cur:
-                self.max_grad_norm = self._clamp_C(float(best_cb))
+            lower_boundary = 0.1 * C_cur
+            upper_boundary = 2.0 * C_cur
+            at_boundary = math.isclose(best_cb, lower_boundary) or math.isclose(
+                best_cb, upper_boundary
+            )
+            next_c = self._clamp_C(float(best_cb))
+            self.max_grad_norm = next_c
+
+            if not at_boundary:
                 break
-            else:
-                self.max_grad_norm = self._clamp_C(float(best_cb))
+
+            # The requested expansion cannot move beyond the configured C range.
+            if math.isclose(next_c, C_cur):
+                break
+        else:
+            logger.warning(
+                "[DCSGDE] boundary search reached %d iterations; "
+                "using the final paper-grid candidate C=%.6f.",
+                self.max_boundary_search_iterations,
+                float(self.max_grad_norm),
+            )
 
         # Update stride heuristics (author code)
         if hist[bin_cnt - 1] > (noise_sum * 0.5):
@@ -269,6 +315,7 @@ class DCSGDEOptimizer(DPOptimizer):
                 self.stride = max(new_stride, min_stride)
 
         self.norm_stack = []
+        self._histogram_query_pending = False
 
     def zero_grad(self, set_to_none: bool = False):
         """
@@ -282,18 +329,30 @@ class DCSGDEOptimizer(DPOptimizer):
         """
         Standard DP-SGD clipping (Abadi-style) + collect per-sample norms for histogram update.
         """
-        per_param_norms = [g.view(len(g), -1).norm(2, dim=-1) for g in self.grad_samples]
-        if not per_param_norms:
+        grad_samples = self.grad_samples
+        if not grad_samples:
             return
+        if len(grad_samples[0]) == 0:
+            per_sample_norms = grad_samples[0].new_zeros((0,))
+        else:
+            per_param_norms = [
+                grad_sample.reshape(len(grad_sample), -1).norm(2, dim=-1)
+                for grad_sample in grad_samples
+            ]
+            per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
 
-        per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
+        # Preserve this flag across physical BatchMemoryManager chunks and clear
+        # it only after the one noisy histogram release for the logical step.
+        self._histogram_query_pending = True
 
         # Store norms as python floats (safe across CPU/CUDA and avoids device issues later)
         # This is slower but faithful to the author-style estimator.
         for n in per_sample_norms.detach():
             self.norm_stack.append(float(n.item()))
 
-        per_sample_clip_factor = (self.max_grad_norm / (per_sample_norms + 1e-6)).clamp(max=1.0)
+        per_sample_clip_factor = (self.max_grad_norm / (per_sample_norms + 1e-6)).clamp(
+            max=1.0
+        )
 
         for p in self.params:
             _check_processed_flag(p.grad_sample)
@@ -321,7 +380,9 @@ class DCSGDEOptimizer(DPOptimizer):
             # restore so accountant step_hook sees sigma_total
             self.noise_multiplier = orig_nm
 
-    def pre_step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+    def pre_step(
+        self, closure: Optional[Callable[[], float]] = None
+    ) -> Optional[float]:
         """
         Run DP step then update clipping threshold for next step.
         """
@@ -334,10 +395,7 @@ class DCSGDEOptimizer(DPOptimizer):
         """
         Enforce [c_min, c_max] bounds (if provided) plus absolute minimum.
         """
-        C_val = max(C_val, self.c_min, _MIN_CLIP)
-        if self.c_max != float("inf"):
-            C_val = min(C_val, self.c_max)
-        return C_val
+        return min(max(C_val, self.c_min), self.c_max)
 
     def _get_stride_floor(self) -> float:
         """
@@ -348,3 +406,79 @@ class DCSGDEOptimizer(DPOptimizer):
         C_cur = float(self.max_grad_norm)
         rel_floor = abs(C_cur) * _MIN_STRIDE_REL
         return max(_MIN_STRIDE_ABS, rel_floor)
+
+    def state_dict(self):
+        """Checkpoint only DP-post-processed state at a logical-step boundary."""
+        if (
+            self._is_last_step_skipped
+            or self.norm_stack
+            or self._histogram_query_pending
+            or self._has_unprocessed_private_state()
+        ):
+            raise RuntimeError(
+                "Cannot checkpoint DCSGDE during an incomplete logical batch: "
+                "norm_stack contains raw per-sample gradient norms. Checkpoint only "
+                "after a complete optimizer step."
+            )
+
+        state = super().state_dict()
+        state[_STATE_DICT_KEY] = {
+            "version": 1,
+            # These values are public counters or post-processing of a DP histogram.
+            "max_grad_norm": float(self.max_grad_norm),
+            "timer": int(self.timer),
+            "stride": float(self.stride),
+            "last_boundary_search_iterations": int(
+                self._last_boundary_search_iterations
+            ),
+        }
+        return state
+
+    def _has_unprocessed_private_state(self) -> bool:
+        """Return whether backward/clipping has not completed its noisy release."""
+        for parameter in self.params:
+            for attribute in ("grad_sample", "summed_grad"):
+                value = getattr(parameter, attribute, None)
+                tensors = value if isinstance(value, list) else [value]
+                if any(
+                    isinstance(tensor, torch.Tensor)
+                    and not hasattr(tensor, "_processed")
+                    for tensor in tensors
+                ):
+                    return True
+        return False
+
+    def load_state_dict(self, state_dict) -> None:
+        """Restore both the wrapped optimizer and histogram-controller state."""
+        controller_state = state_dict.get(_STATE_DICT_KEY)
+        optimizer_state = {
+            key: value for key, value in state_dict.items() if key != _STATE_DICT_KEY
+        }
+        super().load_state_dict(optimizer_state)
+
+        # Backwards compatibility with checkpoints produced before controller state
+        # was included.
+        if controller_state is None:
+            return
+
+        restored_c = float(controller_state["max_grad_norm"])
+        if not (math.isfinite(restored_c) and self.c_min <= restored_c <= self.c_max):
+            raise ValueError(
+                "DCSGDE checkpoint max_grad_norm lies outside the configured bounds."
+            )
+
+        restored_stride = float(controller_state["stride"])
+        if not (math.isfinite(restored_stride) and restored_stride > 0):
+            raise ValueError("DCSGDE checkpoint stride must be finite and positive.")
+
+        self.max_grad_norm = restored_c
+        self.timer = int(controller_state.get("timer", 0))
+        self.stride = max(restored_stride, self._get_stride_floor())
+        # Raw/in-flight per-sample data is intentionally never serialized.
+        self.sample_size = 0
+        self.unclipped_num = 0
+        self.norm_stack = []
+        self._histogram_query_pending = False
+        self._last_boundary_search_iterations = int(
+            controller_state.get("last_boundary_search_iterations", 0)
+        )

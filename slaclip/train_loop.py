@@ -18,7 +18,11 @@ def _extract_logits(outputs) -> torch.Tensor:
         return outputs
     if hasattr(outputs, "logits") and torch.is_tensor(outputs.logits):
         return outputs.logits
-    if isinstance(outputs, dict) and "logits" in outputs and torch.is_tensor(outputs["logits"]):
+    if (
+        isinstance(outputs, dict)
+        and "logits" in outputs
+        and torch.is_tensor(outputs["logits"])
+    ):
         return outputs["logits"]
     if isinstance(outputs, (tuple, list)) and outputs and torch.is_tensor(outputs[0]):
         return outputs[0]
@@ -46,16 +50,92 @@ def train_one_epoch(
     privacy_engine=None,
     delta: float | None = None,
     on_batch_end=None,
-) -> Tuple[float, float, bool]:
+    expose_training_metrics: bool = True,
+) -> Tuple[float, float, bool, int]:
     model.train()
     total_loss = 0.0
     total_acc = 0.0
     count = 0
     stopped_early = False
+    logical_steps = 0
+
+    def current_epsilon() -> float:
+        if privacy_engine is not None and delta is not None:
+            try:
+                return float(privacy_engine.accountant.get_epsilon(delta=float(delta)))
+            except Exception:
+                pass
+        return float("nan")
+
+    def is_logical_release() -> bool:
+        # BatchMemoryManager marks intermediate physical chunks as skipped.
+        return not bool(getattr(optimizer, "_is_last_step_skipped", False))
+
+    def emit_callback(
+        *, physical_step: int, batch_acc: float, empty_batch: bool
+    ) -> bool:
+        nonlocal logical_steps
+        if not is_logical_release():
+            return False
+        logical_steps += 1
+        if on_batch_end is None:
+            return False
+        return bool(
+            on_batch_end(
+                {
+                    "epoch": int(epoch),
+                    "physical_step": int(physical_step),
+                    "logical_step": int(logical_steps),
+                    "epsilon": current_epsilon(),
+                    "batch_acc": (
+                        float(batch_acc)
+                        if expose_training_metrics
+                        else float("nan")
+                    ),
+                    "running_acc": (
+                        float(total_acc / max(1, count))
+                        if expose_training_metrics and count
+                        else float("nan")
+                    ),
+                    "empty_batch": bool(empty_batch),
+                    "optimizer": optimizer,
+                }
+            )
+        )
 
     for step_idx, batch in enumerate(loader, start=1):
         inputs, targets = batch
         if targets.numel() == 0:
+            # A Poisson sampler can draw an empty logical batch. Skipping it
+            # would silently change both the fixed-step paper mechanism and its
+            # accountant. Opacus DP optimizers represent it using a leading
+            # grad-sample dimension of zero, which releases pure Gaussian noise
+            # and invokes the attached accountant hook exactly once. For a
+            # non-private custom run, there is no mechanism to execute.
+            if privacy_engine is None:
+                continue
+            optimizer.zero_grad(set_to_none=True)
+            parameters = getattr(optimizer, "params", None)
+            if parameters is None:
+                raise RuntimeError(
+                    "DP optimizer does not expose parameters for an empty batch"
+                )
+            for parameter in parameters:
+                parameter.grad_sample = torch.empty(
+                    (0,) + tuple(parameter.shape),
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                )
+            optimizer.step()
+            should_stop = emit_callback(
+                physical_step=step_idx,
+                batch_acc=float("nan"),
+                empty_batch=True,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            if should_stop:
+                stopped_early = True
+                break
             continue
         targets = targets.to(device, non_blocking=True)
 
@@ -65,37 +145,31 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
-        bs = int(targets.shape[0])
-        total_loss += float(loss.item()) * bs
-        total_acc += _accuracy(logits, targets) * bs
-        count += bs
+        batch_accuracy = float("nan")
+        if expose_training_metrics:
+            bs = int(targets.shape[0])
+            batch_accuracy = _accuracy(logits, targets)
+            total_loss += float(loss.item()) * bs
+            total_acc += batch_accuracy * bs
+            count += bs
 
-        eps = float("nan")
-        if privacy_engine is not None and delta is not None:
-            try:
-                eps = float(privacy_engine.accountant.get_epsilon(delta=float(delta)))
-            except Exception:
-                eps = float("nan")
+        should_stop = emit_callback(
+            physical_step=step_idx,
+            batch_acc=batch_accuracy,
+            empty_batch=False,
+        )
+        if should_stop:
+            stopped_early = True
+            break
 
-        if on_batch_end is not None:
-            running_acc = total_acc / max(1, count)
-            should_stop = on_batch_end(
-                {
-                    "epoch": int(epoch),
-                    "step": int(step_idx),
-                    "epsilon": float(eps),
-                    "batch_acc": float(_accuracy(logits, targets)),
-                    "running_acc": float(running_acc),
-                    "optimizer": optimizer,
-                }
-            )
-            if should_stop:
-                stopped_early = True
-                break
-
+    if not expose_training_metrics:
+        # Per-example training losses and labels are private queries unless a
+        # separate DP measurement mechanism and budget are supplied. The paper
+        # runner suppresses them for every private method.
+        return float("nan"), float("nan"), stopped_early, logical_steps
     if count == 0:
-        return 0.0, 0.0, stopped_early
-    return total_loss / count, total_acc / count, stopped_early
+        return 0.0, 0.0, stopped_early, logical_steps
+    return total_loss / count, total_acc / count, stopped_early, logical_steps
 
 
 def evaluate(
@@ -141,7 +215,13 @@ def evaluate(
 def build_epoch_record(
     *,
     epoch: int,
-    test_accuracy: float,
+    train_loss: float,
+    train_accuracy: float,
+    validation_loss: float | None,
+    validation_accuracy: float | None,
+    test_loss: float | None,
+    test_accuracy: float | None,
+    logical_steps_completed: int,
     privacy_engine,
     delta: float,
     meta: Dict,
@@ -157,11 +237,28 @@ def build_epoch_record(
 
     record = {
         "epoch": int(epoch),
+        "logical_steps_completed": int(logical_steps_completed),
+        "train_loss": float(train_loss),
+        "train_accuracy": float(train_accuracy),
+        "validation_loss": (
+            float(validation_loss) if validation_loss is not None else float("nan")
+        ),
+        "validation_accuracy": (
+            float(validation_accuracy)
+            if validation_accuracy is not None
+            else float("nan")
+        ),
+        "test_loss": float(test_loss) if test_loss is not None else float("nan"),
         "epsilon": float(epsilon),
-        "test_accuracy": float(test_accuracy),
+        "delta": float(delta),
+        "test_accuracy": (
+            float(test_accuracy) if test_accuracy is not None else float("nan")
+        ),
         "C_t": float(C_t),
         "dataset": meta.get("dataset", ""),
         "method": meta.get("method", ""),
+        "protocol": meta.get("protocol", ""),
+        "phase": meta.get("phase", ""),
         "seed": meta.get("seed", ""),
     }
     return record

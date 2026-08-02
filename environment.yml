@@ -2,16 +2,15 @@ name: opacus
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
-  - numpy
-  - tqdm
-  - opt_einsum
-  - pytest
-  - datasets
-  - transformers
+  - python=3.10.19
+  - numpy=2.2.6
+  - tqdm=4.67.3
+  - opt_einsum=3.4.0
+  - pytest=9.1.1
+  - datasets=4.5.0
+  - transformers=5.1.0
   - pip
   - pip:
       - --index-url https://download.pytorch.org/whl/cu128
       - torch==2.10.0
       - torchvision==0.25.0
-      - torchaudio==2.10.0

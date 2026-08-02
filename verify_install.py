@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PATCHES_DIR = _THIS_DIR / "patches"
 sys.path.insert(0, str(_PATCHES_DIR))
 _REPO_ROOT = _THIS_DIR.parent
+_PINNED_OPACUS_COMMIT = "f17f254ab8f1f1095e8257bf278769d549748bbc"
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
@@ -16,10 +18,59 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     print(f"[verify] repo_root = {repo_root}")
 
+    def git(*args: str) -> str:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(f"Unable to inspect local Opacus Git state: {exc}") from exc
+
+    try:
+        head = git("rev-parse", "HEAD")
+        ancestor = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "merge-base",
+                "--is-ancestor",
+                _PINNED_OPACUS_COMMIT,
+                head,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).returncode == 0
+        changed_since_base = set(
+            filter(
+                None,
+                git("diff", "--name-only", f"{_PINNED_OPACUS_COMMIT}..{head}").splitlines(),
+            )
+        )
+    except RuntimeError as exc:
+        print(f"FAIL: {exc}")
+        return 1
+
+    allowed_packaging_paths = {".gitmodules", "SlaClip"}
+    unexpected_parent_changes = changed_since_base - allowed_packaging_paths
+    if not ancestor or unexpected_parent_changes:
+        print("FAIL: parent Opacus code is not the pinned reproduction base.")
+        print(f"Expected base ancestor: {_PINNED_OPACUS_COMMIT}")
+        print(f"Current HEAD: {head}")
+        if unexpected_parent_changes:
+            print(f"Unexpected parent-repo changes: {sorted(unexpected_parent_changes)}")
+        return 1
+    print(f"[verify] pinned Opacus base = {_PINNED_OPACUS_COMMIT}")
+
     try:
         import opacus
         import opacus.privacy_engine
-        from opacus import PrivacyEngine 
+        import opacus.optimizers.optimizer
+        from opacus import GradSampleModule, PrivacyEngine, __version__
     except Exception as e:
         print(f"FAIL: unable to import opacus or PrivacyEngine: {e}")
         print("Fix: run from the Opacus repo root, install deps, then `pip install -e .`.")
@@ -27,8 +78,10 @@ def main() -> int:
 
     opacus_path = Path(getattr(opacus, "__file__", "")).resolve() if getattr(opacus, "__file__", None) else None
     pe_path = Path(opacus.privacy_engine.__file__).resolve()
+    optimizer_base_path = Path(opacus.optimizers.optimizer.__file__).resolve()
     print(f"opacus.__file__ = {opacus_path}")
     print(f"opacus.privacy_engine = {pe_path}")
+    print(f"opacus.optimizers.optimizer = {optimizer_base_path}")
 
     if opacus_path and ("site-packages" in str(opacus_path) or "dist-packages" in str(opacus_path)):
         print("FAIL: opacus resolved to site-packages.")
@@ -72,6 +125,13 @@ def main() -> int:
     upstream_pkg = repo_root / "opacus"
     if str(upstream_pkg) not in [str(p) for p in pkg_paths]:
         print("FAIL: opacus.__path__ does not include upstream opacus package path.")
+        return 1
+
+    try:
+        optimizer_base_path.relative_to(upstream_pkg)
+    except ValueError:
+        print("FAIL: base DPOptimizer is shadowed instead of using pinned Opacus.")
+        print(f"Resolved: {optimizer_base_path}")
         return 1
 
     try:

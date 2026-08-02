@@ -32,6 +32,8 @@ from opacus.grad_sample import (
 )
 from opacus.optimizers import DPOptimizer, get_optimizer_class
 from opacus.optimizers import SlaClipOptimizer, SlaClipQOptimizer
+from opacus.optimizers.DCSGDEOptimizer import DCSGDEOptimizer
+from opacus.optimizers.adaclipoptimizer import AdaClipDPOptimizer
 from opacus.optimizers.autoclipoptimizer import AutoClipDPOptimizer
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
@@ -44,8 +46,12 @@ from torch.utils.data import DataLoader
 
 def _filter_kwargs_for_init(init_fn, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Best-effort filtering: if target __init__ supports **kwargs, keep all.
-    Otherwise only pass parameters that exist in the signature.
+    Filter to explicitly declared constructor parameters.
+
+    Custom paper optimizers retain ``**kwargs`` for compatibility with the
+    upstream Opacus wrapper, but treating that as permission to accept every
+    spelling would silently change experiments. Unknown method options are
+    therefore reported even when a constructor has a variadic keyword sink.
     Returns (filtered_kwargs, dropped_keys).
     """
     try:
@@ -54,11 +60,13 @@ def _filter_kwargs_for_init(init_fn, kwargs: Dict[str, Any]) -> Tuple[Dict[str, 
         return dict(kwargs), []
 
     params = sig.parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return dict(kwargs), []
-
-    allowed = set(params.keys())
-    allowed.discard("self")
+    allowed = {
+        name
+        for name, parameter in params.items()
+        if name != "self"
+        and parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     dropped = [k for k in kwargs.keys() if k not in allowed]
     return filtered, dropped
@@ -112,11 +120,35 @@ class PrivacyEngine:
         *,
         clipping: str,
         poisson_sampling: bool,
+        distributed: bool,
+        grad_sample_mode: str,
         kwargs: Dict[str, Any],
     ) -> None:
         """
-        In strict mode, block switches that may invalidate DP guarantees.
+        Block structurally unsupported paper-method combinations before wrapping.
+
+        Privacy-mode checks and implementation-compatibility checks deliberately
+        happen before installing grad-sample hooks or replacing the data loader.
+        A rejected call therefore leaves all caller-owned objects untouched.
         """
+        paper_clipping = {
+            "slaclip",
+            "slaclip-q",
+            "adaptive",
+            "dc-sgd-e",
+            "autoclip",
+        }
+        if clipping in paper_clipping:
+            if distributed:
+                raise ValueError(
+                    f"{clipping} has no validated distributed optimizer implementation"
+                )
+            if grad_sample_mode != "hooks":
+                raise ValueError(
+                    f"{clipping} requires grad_sample_mode='hooks'; the custom "
+                    "optimizer consumes per-example gradients from the hooks backend"
+                )
+
         if self.privacy_mode != "strict":
             return
 
@@ -127,12 +159,25 @@ class PrivacyEngine:
             raise ValueError("[privacy_mode=strict] error_probe_enabled is research-only.")
 
         if not poisson_sampling:
-            warnings.warn(
-                "[privacy_mode=strict] poisson_sampling=False does not match the Poisson "
-                "sampling assumption used by standard DP accountants. Results may be an "
-                "approximation unless your pipeline justifies this setting.",
-                stacklevel=2,
+            raise ValueError(
+                "[privacy_mode=strict] paper methods require Poisson sampling so the "
+                "runtime sampling event matches the configured privacy accountant. "
+                "Use privacy_mode='research' only for an explicitly justified alternative."
             )
+
+    def _handle_dropped_optimizer_kwargs(
+        self,
+        *,
+        optimizer_name: str,
+        dropped: List[str],
+    ) -> None:
+        """Never silently change a paper method because of a misspelled option."""
+        if not dropped:
+            return
+        message = f"{optimizer_name} received unsupported keyword arguments: {sorted(dropped)}"
+        if self.privacy_mode == "strict":
+            raise TypeError(message)
+        warnings.warn(f"[PrivacyEngine] {message}", stacklevel=3)
 
     def _prepare_optimizer(
         self,
@@ -150,6 +195,14 @@ class PrivacyEngine:
     ) -> DPOptimizer:
         if isinstance(optimizer, DPOptimizer):
             optimizer = optimizer.original_optimizer
+
+        paper_optimizer_classes = {
+            "slaclip": SlaClipOptimizer,
+            "slaclip-q": SlaClipQOptimizer,
+            "adaptive": AdaClipDPOptimizer,
+            "dc-sgd-e": DCSGDEOptimizer,
+            "autoclip": AutoClipDPOptimizer,
+        }
 
         generator = None
         if self.secure_mode:
@@ -170,11 +223,9 @@ class PrivacyEngine:
                 "secure_mode",
             ):
                 sl_kwargs.pop(k, None)
-            if dropped:
-                warnings.warn(
-                    f"[PrivacyEngine] SlaClip optimizer ignored unknown kwargs: {dropped}",
-                    stacklevel=2,
-                )
+            self._handle_dropped_optimizer_kwargs(
+                optimizer_name=target_cls.__name__, dropped=dropped
+            )
 
             return target_cls(
                 optimizer=optimizer,
@@ -202,11 +253,9 @@ class PrivacyEngine:
             ):
                 ac_kwargs.pop(k, None)
 
-            if dropped:
-                warnings.warn(
-                    f"[PrivacyEngine] AutoClipDPOptimizer ignored unknown kwargs: {dropped}",
-                    stacklevel=2,
-                )
+            self._handle_dropped_optimizer_kwargs(
+                optimizer_name=AutoClipDPOptimizer.__name__, dropped=dropped
+            )
 
             return AutoClipDPOptimizer(
                 optimizer=optimizer,
@@ -219,6 +268,33 @@ class PrivacyEngine:
                 generator=generator,
                 loss_reduction=loss_reduction,
                 **ac_kwargs,
+            )
+
+        if clipping in ("adaptive", "dc-sgd-e"):
+            target_cls = paper_optimizer_classes[clipping]
+            method_kwargs, dropped = _filter_kwargs_for_init(target_cls.__init__, kwargs)
+            for key in (
+                "optimizer",
+                "noise_multiplier",
+                "max_grad_norm",
+                "expected_batch_size",
+                "loss_reduction",
+                "generator",
+                "secure_mode",
+            ):
+                method_kwargs.pop(key, None)
+            self._handle_dropped_optimizer_kwargs(
+                optimizer_name=target_cls.__name__, dropped=dropped
+            )
+            return target_cls(
+                optimizer=optimizer,
+                noise_multiplier=noise_multiplier,
+                max_grad_norm=max_grad_norm,
+                expected_batch_size=expected_batch_size,
+                loss_reduction=loss_reduction,
+                generator=generator,
+                secure_mode=self.secure_mode,
+                **method_kwargs,
             )
 
         optim_class = get_optimizer_class(
@@ -244,7 +320,6 @@ class PrivacyEngine:
         *,
         poisson_sampling: bool,
         distributed: bool,
-        generator=None,
     ) -> DataLoader:
         if self.dataset is None:
             self.dataset = data_loader.dataset
@@ -259,23 +334,12 @@ class PrivacyEngine:
                 stacklevel=2,
             )
 
-        dl_gen = self.secure_rng if self.secure_mode else generator
-
         if poisson_sampling:
             return DPDataLoader.from_data_loader(
-                data_loader, generator=dl_gen, distributed=distributed
+                data_loader, generator=self.secure_rng, distributed=distributed
             )
-
-        if dl_gen is not None:
-            try:
-                return switch_generator(data_loader=data_loader, generator=dl_gen)
-            except Exception as e:
-                warnings.warn(
-                    f"[PrivacyEngine] switch_generator failed, fallback to original data_loader. Error: {e}",
-                    stacklevel=2,
-                )
-                return data_loader
-
+        if self.secure_mode:
+            return switch_generator(data_loader=data_loader, generator=self.secure_rng)
         return data_loader
 
     def _prepare_model(
@@ -380,11 +444,6 @@ class PrivacyEngine:
         if noise_generator and self.secure_mode:
             raise ValueError("Passing noise_generator is prohibited in secure mode")
 
-        # Guardrails first (before constructing optimizer wrappers)
-        self._enforce_privacy_mode_guardrails(
-            clipping=clipping, poisson_sampling=poisson_sampling, kwargs=kwargs
-        )
-
         # Compare module parameters with optimizer parameters
         model_parameters = set(module.parameters())
         for p in chain.from_iterable(
@@ -394,6 +453,16 @@ class PrivacyEngine:
                 raise ValueError("Module parameters are different than optimizer Parameters")
 
         distributed = isinstance(module, (DPDDP, DDP, FSDPModule))
+
+        # Guardrails run before model hooks or sampler replacement, so a rejected
+        # configuration cannot leave the caller's module partially wrapped.
+        self._enforce_privacy_mode_guardrails(
+            clipping=clipping,
+            poisson_sampling=poisson_sampling,
+            distributed=distributed,
+            grad_sample_mode=grad_sample_mode,
+            kwargs=kwargs,
+        )
 
         module = self._prepare_model(
             module,
@@ -409,7 +478,6 @@ class PrivacyEngine:
             data_loader,
             distributed=distributed,
             poisson_sampling=poisson_sampling,
-            generator=noise_generator,
         )
 
         sample_rate = 1 / len(data_loader)
@@ -469,6 +537,7 @@ class PrivacyEngine:
         clipping: str = "flat",
         noise_generator=None,
         grad_sample_mode: str = "hooks",
+        epsilon_tolerance: float = 0.01,
         **kwargs,
     ) -> Union[
         Tuple[GradSampleModule, DPOptimizer, DataLoader],
@@ -495,7 +564,7 @@ class PrivacyEngine:
                 sample_rate=sample_rate,
                 epochs=epochs,
                 accountant=self.accountant.mechanism(),
-                **kwargs,
+                epsilon_tolerance=float(epsilon_tolerance),
             ),
             max_grad_norm=max_grad_norm,
             batch_first=batch_first,

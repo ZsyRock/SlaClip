@@ -31,6 +31,12 @@ from .optimizer import (
 
 logger = logging.getLogger(__name__)
 
+_EXPERIMENT_C_MIN = 0.1
+_EXPERIMENT_C_MAX = 20.0
+_PERCENTILE_MIN = 0.01
+_PERCENTILE_MAX = 0.99
+_STATE_DICT_KEY = "_slaclip_adaclip_state"
+
 
 class AdaClipDPOptimizer(DPOptimizer):
     """
@@ -56,17 +62,30 @@ class AdaClipDPOptimizer(DPOptimizer):
         **kwargs,
     ):
         noise_multiplier = float(noise_multiplier)
-        if not (0.0 <= target_unclipped_quantile <= 1.0):
-            raise ValueError("target_unclipped_quantile must be in [0, 1].")
+        if not (_PERCENTILE_MIN <= float(target_unclipped_quantile) <= _PERCENTILE_MAX):
+            raise ValueError("target_unclipped_quantile must be in [0.01, 0.99].")
         if clipbound_learning_rate <= 0:
             raise ValueError("clipbound_learning_rate must be > 0.")
-        if max_clipbound <= 0 or min_clipbound <= 0:
-            raise ValueError("max_clipbound and min_clipbound must be > 0.")
+        if not (_EXPERIMENT_C_MIN <= float(min_clipbound) <= _EXPERIMENT_C_MAX):
+            raise ValueError("min_clipbound must be in [0.1, 20.0].")
+        if not (_EXPERIMENT_C_MIN <= float(max_clipbound) <= _EXPERIMENT_C_MAX):
+            raise ValueError("max_clipbound must be in [0.1, 20.0].")
         if max_clipbound <= min_clipbound:
             raise ValueError("max_clipbound must be larger than min_clipbound.")
+        if not (float(min_clipbound) <= float(max_grad_norm) <= float(max_clipbound)):
+            raise ValueError(
+                "max_grad_norm must lie inside [min_clipbound, max_clipbound]."
+            )
         unclipped_num_std = float(unclipped_num_std)
         if unclipped_num_std <= 0:
             raise ValueError("unclipped_num_std must be > 0.")
+        if loss_reduction != "mean":
+            raise ValueError(
+                "AdaClip requires loss_reduction='mean' so its privatized "
+                "centered count uses a fixed expected-batch denominator."
+            )
+        if expected_batch_size is None or int(expected_batch_size) <= 0:
+            raise ValueError("expected_batch_size must be a positive integer.")
 
         self._accountant_noise_multiplier = noise_multiplier
 
@@ -94,7 +113,7 @@ class AdaClipDPOptimizer(DPOptimizer):
         self.unclipped_num_std = float(unclipped_num_std)
 
         if self._accountant_noise_multiplier > 0:
-            inv_sigma_total_sq = (self._accountant_noise_multiplier ** -2)
+            inv_sigma_total_sq = self._accountant_noise_multiplier**-2
             inv_2sigb_sq = (2.0 * self.unclipped_num_std) ** -2
             # sigma_grad^{-2} = sigma_total^{-2} - (2*sigma_b)^{-2}
             inv_sigma_grad_sq = inv_sigma_total_sq - inv_2sigb_sq
@@ -107,8 +126,17 @@ class AdaClipDPOptimizer(DPOptimizer):
         else:
             self._grad_noise_multiplier = 0.0
 
+        # The paper's Theorem 1 uses the sensitivity-1/2 centered bit
+        # (1{||g_i|| <= C} - 1/2).  Keeping that query centered is essential under
+        # add/remove Poisson sampling: division by the realized private batch size
+        # would make the release distribution data-dependent.  ``sample_size`` is
+        # retained only as an in-flight diagnostic and is never released or saved.
         self.sample_size: int = 0
-        self.unclipped_num: float = 0.0
+        self.centered_unclipped_sum: float = 0.0
+        self.noisy_unclipped_fraction: Optional[float] = None
+        # Privacy-sensitive phase flags. Raw state must never be serialized.
+        self._count_query_pending = False
+        self._controller_update_pending = False
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
@@ -145,23 +173,40 @@ class AdaClipDPOptimizer(DPOptimizer):
 
     def zero_grad(self, set_to_none: bool = False):
         """
-        Clear gradients and reset counters.
+        Clear gradients and reset counters after a complete logical batch.
+
+        BatchMemoryManager calls zero_grad() between physical batches while
+        ``_is_last_step_skipped`` is true. Preserve the count query across those
+        chunks, just as DPOptimizer preserves ``summed_grad``.
         """
         super().zero_grad(set_to_none)
-        self.sample_size = 0
-        self.unclipped_num = 0.0
+        if not self._is_last_step_skipped:
+            self.sample_size = 0
+            self.centered_unclipped_sum = 0.0
+            self.noisy_unclipped_fraction = None
+            self._count_query_pending = False
+            self._controller_update_pending = False
 
     def clip_and_accumulate(self):
         """
         Clip gradients and update unclipped count.
         """
-        per_param_norms = [g.view(len(g), -1).norm(2, dim=-1) for g in self.grad_samples]
-        if not per_param_norms:
+        grad_samples = self.grad_samples
+        if not grad_samples:
             return
-
-        per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
-        if per_sample_norms.numel() == 0:
-            return
+        if len(grad_samples[0]) == 0:
+            per_sample_norms = grad_samples[0].new_zeros((0,))
+        else:
+            per_param_norms = [
+                grad_sample.reshape(len(grad_sample), -1).norm(2, dim=-1)
+                for grad_sample in grad_samples
+            ]
+            per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
+        # These flags are cleared only after the complete logical-step controller
+        # phase, including an empty Poisson batch. Every logical Poisson step must
+        # therefore execute the same Gaussian count-release path.
+        self._count_query_pending = True
+        self._controller_update_pending = True
 
         per_sample_clip_factor = (
             float(self.max_grad_norm) / (per_sample_norms + 1e-6)
@@ -169,8 +214,10 @@ class AdaClipDPOptimizer(DPOptimizer):
 
         bs = int(per_sample_clip_factor.numel())
         self.sample_size += bs
-        # unclipped: clip_factor == 1
-        self.unclipped_num += float((per_sample_clip_factor >= 1.0).sum().item())
+        unclipped = per_sample_norms <= float(self.max_grad_norm)
+        self.centered_unclipped_sum += float(
+            (unclipped.to(dtype=torch.float32) - 0.5).sum().item()
+        )
 
         for p in self.params:
             _check_processed_flag(p.grad_sample)
@@ -188,8 +235,21 @@ class AdaClipDPOptimizer(DPOptimizer):
 
     def add_noise(self):
         """
-        Add noise to gradients and unclipped counts.
+        Add noise to gradients and to the sensitivity-1/2 centered count.
+
+        The released fraction is ``clip(1/2 + (sum_i(b_i-1/2)+Z)/B, 0, 1)``
+        with a fixed public expected-batch denominator.  For a fixed-size batch
+        this is algebraically identical to the paper's noisy unclipped fraction;
+        for Poisson batches it avoids exposing the realized private batch size.
         """
+        count_release_denom = float(self.expected_batch_size) * float(
+            self.accumulated_iterations
+        )
+        if dist.is_available() and dist.is_initialized():
+            count_release_denom *= float(dist.get_world_size())
+        if count_release_denom <= 0:
+            raise ValueError("AdaClip count-release denominator must be positive.")
+
         orig_nm = float(self.noise_multiplier)
         try:
             if float(self._grad_noise_multiplier) != orig_nm:
@@ -198,22 +258,16 @@ class AdaClipDPOptimizer(DPOptimizer):
         finally:
             self.noise_multiplier = orig_nm
 
-        if self.sample_size <= 0:
-            return
-
         comm_dev = self._dist_device(torch.device("cpu"))
         t = torch.tensor(
-            [float(self.unclipped_num), float(self.sample_size)],
+            float(self.centered_unclipped_sum),
             device=comm_dev,
             dtype=torch.float32,
         )
         self._all_reduce_inplace_sum(t)
 
-        unclipped_total = float(t[0].item())
-        sample_size_total = int(round(float(t[1].item())))
-        sample_size_total = max(sample_size_total, 0)
-
-        ref = torch.tensor(unclipped_total, device=comm_dev, dtype=torch.float32)
+        centered_total = float(t.item())
+        ref = torch.tensor(centered_total, device=comm_dev, dtype=torch.float32)
         noise = torch.zeros_like(ref)
 
         rank = 0
@@ -233,18 +287,26 @@ class AdaClipDPOptimizer(DPOptimizer):
 
         self._broadcast_inplace(noise, src=0)
 
-        self.unclipped_num = float(unclipped_total + float(noise.item()))
-        self.sample_size = int(sample_size_total)
+        noisy_fraction = (
+            0.5 + (centered_total + float(noise.item())) / count_release_denom
+        )
+        self.noisy_unclipped_fraction = max(0.0, min(1.0, noisy_fraction))
+
+        # Discard all raw query state immediately after the DP release. Only the
+        # privatized fraction remains available to the controller.
+        self.centered_unclipped_sum = 0.0
+        self.sample_size = 0
+        self._count_query_pending = False
+        self._controller_update_pending = True
 
     def update_max_grad_norm(self):
         """
         Update C and clamp to [min_clipbound, max_clipbound].
         """
-        if self.sample_size <= 0:
+        if self.noisy_unclipped_fraction is None:
             return
 
-        unclipped_frac = float(self.unclipped_num) / float(self.sample_size)
-        unclipped_frac = max(0.0, min(1.0, unclipped_frac))
+        unclipped_frac = float(self.noisy_unclipped_fraction)
 
         scale = math.exp(
             -float(self.clipbound_learning_rate)
@@ -260,8 +322,12 @@ class AdaClipDPOptimizer(DPOptimizer):
             new_c = float(c_t.item())
 
         self.max_grad_norm = float(new_c)
+        self.noisy_unclipped_fraction = None
+        self._controller_update_pending = False
 
-    def pre_step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+    def pre_step(
+        self, closure: Optional[Callable[[], float]] = None
+    ) -> Optional[float]:
         """
         Run DP processing before optimizer.step().
         """
@@ -277,3 +343,66 @@ class AdaClipDPOptimizer(DPOptimizer):
             self.update_max_grad_norm()
 
         return res
+
+    def state_dict(self):
+        """Checkpoint only post-processed state at a complete logical-step boundary."""
+        if (
+            self._is_last_step_skipped
+            or self._count_query_pending
+            or self._controller_update_pending
+            or self._has_unprocessed_grad_samples()
+        ):
+            raise RuntimeError(
+                "Cannot checkpoint AdaClip during an incomplete logical batch: "
+                "the unclipped-count query has not completed its DP release and "
+                "controller update. Checkpoint only after a complete optimizer step."
+            )
+
+        state = super().state_dict()
+        state[_STATE_DICT_KEY] = {
+            "version": 1,
+            # max_grad_norm is post-processing of a DP count release.
+            "max_grad_norm": float(self.max_grad_norm),
+        }
+        return state
+
+    def _has_unprocessed_grad_samples(self) -> bool:
+        """Return whether backward produced gradients not consumed by a DP step."""
+        for parameter in self.params:
+            grad_sample = getattr(parameter, "grad_sample", None)
+            tensors = grad_sample if isinstance(grad_sample, list) else [grad_sample]
+            if any(
+                isinstance(tensor, torch.Tensor) and not hasattr(tensor, "_processed")
+                for tensor in tensors
+            ):
+                return True
+        return False
+
+    def load_state_dict(self, state_dict) -> None:
+        """Restore both the wrapped optimizer and adaptive clipping state."""
+        controller_state = state_dict.get(_STATE_DICT_KEY)
+        optimizer_state = {
+            key: value for key, value in state_dict.items() if key != _STATE_DICT_KEY
+        }
+        super().load_state_dict(optimizer_state)
+
+        # Backwards compatibility: old checkpoints only stored the wrapped optimizer.
+        if controller_state is None:
+            return
+
+        restored_c = float(controller_state["max_grad_norm"])
+        if not (
+            math.isfinite(restored_c)
+            and self.min_clipbound <= restored_c <= self.max_clipbound
+        ):
+            raise ValueError(
+                "AdaClip checkpoint max_grad_norm lies outside the configured bounds."
+            )
+
+        self.max_grad_norm = restored_c
+        # Raw/in-flight query buffers are intentionally never serialized.
+        self.sample_size = 0
+        self.centered_unclipped_sum = 0.0
+        self.noisy_unclipped_fraction = None
+        self._count_query_pending = False
+        self._controller_update_pending = False
