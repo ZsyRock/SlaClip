@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_on": "2026-08-02",
+  "recorded_on": "2026-08-03",
   "paper": {
     "title": "SlaClip: Gradient Norm Slacks can be Indicator for Adaptive Clipping in DP-SGD",
     "venue": "ICML 2026",
@@ -12,15 +12,19 @@
     "repository": "https://github.com/ZsyRock/SlaClip.git",
     "base_commit": "d48b8e07aef33c58a3595ee18b4dccf9c75fa1f3",
     "local_branch": "reproduction-faithful-20260802",
-    "release_tag": "slaclip-reproduction-v1",
-    "note": "The audited commit/tag is local and is not pushed by this repair task."
+    "previous_audited_commit": "c9a962c9bf42e9704f0d6db8dd2670e76ed718c6",
+    "exact_poisson_accounting_fix_commit": "2faa9add914418663136de482d7fe3d6d5a42dac",
+    "release_tag": "slaclip-reproduction-v2",
+    "note": "The v2 tag identifies the final audited reproduction state; the exact accounting implementation was introduced by the recorded fix commit."
   },
   "opacus_upstream": {
     "repository": "https://github.com/meta-pytorch/opacus.git",
     "commit": "f17f254ab8f1f1095e8257bf278769d549748bbc",
     "describe": "v1.5.4-21-gf17f254",
     "local_packaging_branch": "slaclip-opacus-base",
-    "local_packaging_tag": "opacus-aug-slaclip-v1"
+    "local_packaging_tag": "opacus-aug-slaclip-v1",
+    "local_packaging_commit": "fb20300817e6c939c1860a8d57ae768b7e3def65",
+    "note": "No Opacus commit was made for the v2 SlaClip repair; the nested SlaClip commit is recorded independently."
   },
   "declared_engineering_guardrails": {
     "clip_norm_min": 0.1,
@@ -32,6 +36,9 @@
   },
   "protocol_numerics": {
     "main_noise_calibration_epsilon_tolerance": 1e-5,
+    "main_poisson_rate": "1/ceil(N/B)",
+    "main_release_count": "ceil(N/B)*epochs, passed as an exact integer",
+    "epsilon_boundary_policy": "Complete the full horizon when epsilon(T)<=target; otherwise accept only a proved one-final-release fallback with epsilon(T-1)<=target<epsilon(T)",
     "table2_regression_entries": 45,
     "published_shared_grid_candidates": 16200,
     "selected_method_dataset_budget_winners": 90,
@@ -55,15 +62,28 @@
     "default_max_physical_batch_text": 32,
     "outputs_overwrite_by_default": false,
     "private_training_metrics_published": false,
-    "experiments_or_dataset_downloads_performed_during_audit": false
+    "experiments_or_dataset_downloads_performed_during_audit": true
   },
   "audit_verification": {
-    "slaclip_tests_passed": 153,
+    "slaclip_tests_passed": 158,
+    "external_controller_tests_passed": 12,
+    "one_week_controller_tests_passed": 6,
     "table2_noise_entries_checked": 45,
     "selected_opacus_upstream_tests_passed": 177,
     "selected_opacus_upstream_tests_skipped_for_hardware": 12,
     "selected_opacus_upstream_subtests_passed": 22,
-    "test_device": "CPU only",
+    "test_device": "CPU regression suite plus RTX 4060 end-to-end MNIST regression",
+    "end_to_end_regression": {
+      "candidate": "main-select-slaclip-mnist-b2-lr0p05-bs256-c1-constant-s2026",
+      "epochs_completed": 30,
+      "logical_steps_completed": 6330,
+      "sample_rate": 0.004739336492890996,
+      "sigma": 1.0698533058166504,
+      "target_epsilon": 2.0,
+      "actual_epsilon": 1.999993792957338,
+      "validation_accuracy": 0.9454999979337056,
+      "privacy_fallback_used": false
+    },
     "audit_virtual_environment_size": "24 MiB"
   },
   "data_provenance_limit": {
