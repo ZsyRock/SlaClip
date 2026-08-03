@@ -124,6 +124,22 @@ Main runs calibrate sigma over the full prescribed horizon with tolerance
 using the final sigma and actual logical release denominator. Do not pass
 `--sigma` or `--K` in the main protocol.
 
+The runner freezes the paper's integer mechanism before Opacus conversion:
+`q_eff = 1 / ceil(N/B)` and `T = ceil(N/B) * epochs`.  This avoids floating-
+point reciprocal truncation (for example, `1 / (1/211)` falling just below
+211) and asserts that the Poisson sampler, optimizer normalization, metadata,
+and accountant all use the same values before training starts.  Noise
+calibration receives the exact integer `T`, never a floating `epochs/q`
+conversion.
+
+A precomputed privacy guard prevents an over-budget Gaussian release. Normal
+paper runs must complete all `T` releases on the safe side of the target. If
+numerical calibration makes only release `T` exceed the target, the runner may
+stop at `T-1` and records both the last compliant epsilon and the projected
+epsilon of the omitted release. Validators accept this fallback only when
+exactly one final release is omitted and `epsilon(T-1) <= target < epsilon(T)`;
+larger mismatches remain hard failures.
+
 After validation selection, retrain the chosen candidate separately with seeds
 42, 43, and 44 using `--phase retrain`. Retraining restores the complete
 official training split and touches the test set only at the end.
@@ -154,7 +170,10 @@ python SlaClip/tools/select_main_grid.py \
   --commands-output SlaClip/outputs/main_retrains.sh
 ```
 
-Both tools require clean, matching Git identities. The selector rejects missing
+Both tools require clean, matching Git identities. Because SlaClip is an
+independently versioned nested repository, the outer Opacus cleanliness check
+ignores only the SlaClip gitlink while the exact clean SlaClip commit is checked
+separately. The selector rejects missing
 candidates, mismatched configurations, dirty runs, incomplete horizons, and any
 selection-time test metric. The paper does not publish every method-specific
 adaptive-parameter range or the authors' selected configurations; those are

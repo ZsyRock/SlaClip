@@ -167,6 +167,34 @@ def test_make_private_with_epsilon_separates_calibration_and_optimizer_kwargs(
 
     assert result == "wrapped"
     assert calibration_call["epsilon_tolerance"] == 0.005
+    assert calibration_call["steps"] == len(loader) * 2 == 4
+    assert "epochs" not in calibration_call
     assert "num_slots" not in calibration_call
     assert make_private_call["num_slots"] == 7
     assert make_private_call["noise_multiplier"] == 1.25
+
+
+def test_poisson_conversion_preserves_211_logical_steps_and_sample_rate():
+    model, optimizer = _model_and_optimizer()
+    loader = DataLoader(
+        TensorDataset(torch.zeros(422, 2), torch.zeros(422, dtype=torch.long)),
+        batch_size=2,
+    )
+    assert len(loader) == 211
+    engine = PrivacyEngine(accountant="rdp", secure_mode=False)
+
+    _model, private_optimizer, private_loader = engine.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=1.1,
+        max_grad_norm=1.0,
+        clipping="flat",
+        poisson_sampling=True,
+    )
+
+    assert len(private_loader) == 211
+    assert private_loader.batch_sampler.steps == 211
+    assert private_loader.sample_rate == 1.0 / 211.0
+    assert engine.sample_rate == 1.0 / 211.0
+    assert private_optimizer.expected_batch_size == 2

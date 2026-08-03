@@ -59,7 +59,7 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
-def _git_snapshot(repo: Path) -> dict[str, Any]:
+def _git_snapshot(repo: Path, *, ignore_submodules: bool = False) -> dict[str, Any]:
     def run(*arguments: str) -> str:
         try:
             result = subprocess.run(
@@ -73,14 +73,21 @@ def _git_snapshot(repo: Path) -> dict[str, Any]:
         except (OSError, subprocess.CalledProcessError):
             return ""
 
-    status = run("status", "--porcelain=v1")
+    status_args = ["status", "--porcelain=v1"]
+    if ignore_submodules:
+        status_args.append("--ignore-submodules=all")
+    status = run(*status_args)
+    describe_args = ["describe", "--always", "--tags"]
+    if not ignore_submodules:
+        describe_args.insert(2, "--dirty")
     return {
         "path": str(repo.resolve()),
         "commit": run("rev-parse", "HEAD") or None,
         "branch": run("branch", "--show-current") or None,
-        "describe": run("describe", "--always", "--dirty", "--tags") or None,
+        "describe": run(*describe_args) or None,
         "dirty": bool(status),
         "status_porcelain": status.splitlines(),
+        "submodules_ignored": bool(ignore_submodules),
     }
 
 
@@ -101,8 +108,7 @@ def collect_run_metadata(
     opacus_root: Path,
     slaclip_root: Path,
     device: torch.device,
-    logical_steps_per_epoch: int,
-    expected_batch_size: int,
+    sampling_metadata: dict,
 ) -> dict[str, Any]:
     cuda_device = None
     if device.type == "cuda" and torch.cuda.is_available():
@@ -139,12 +145,28 @@ def collect_run_metadata(
         "sampling": {
             "requested_logical_batch_size": int(args.batch_size),
             "max_physical_batch_size": int(args.max_physical_batch_size),
-            "logical_steps_per_epoch": int(logical_steps_per_epoch),
-            "effective_sample_rate": 1.0 / float(logical_steps_per_epoch),
-            "expected_batch_size": int(expected_batch_size),
+            "logical_steps_per_epoch": int(
+                sampling_metadata["logical_steps_per_epoch"]
+            ),
+            "planned_logical_steps": int(
+                sampling_metadata["planned_logical_steps"]
+            ),
+            "effective_sample_rate": float(sampling_metadata["sample_rate"]),
+            "expected_batch_size": int(sampling_metadata["expected_batch_size"]),
+            "runtime_logical_steps_per_epoch": int(
+                sampling_metadata["runtime_logical_steps_per_epoch"]
+            ),
+            "sampler_sample_rate": sampling_metadata["sampler_sample_rate"],
+            "accountant_sample_rate": sampling_metadata["accountant_sample_rate"],
+            "optimizer_expected_batch_size": sampling_metadata[
+                "optimizer_expected_batch_size"
+            ],
         },
         "git": {
-            "opacus": _git_snapshot(opacus_root),
+            # SlaClip is a separately versioned nested repository. Its commit is
+            # recorded below, so the outer Opacus checkout must ignore only that
+            # gitlink movement rather than requiring an unauthorized Opacus commit.
+            "opacus": _git_snapshot(opacus_root, ignore_submodules=True),
             "slaclip": _git_snapshot(slaclip_root),
         },
         "runtime": {

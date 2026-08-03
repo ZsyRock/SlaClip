@@ -26,6 +26,7 @@ import torch.optim as optim
 try:
     import opacus
     from opacus import PrivacyEngine
+    from opacus.accountants import create_accountant
     from opacus.accountants.utils import get_noise_multiplier
     from opacus.utils.batch_memory_manager import BatchMemoryManager
 except Exception as exc:
@@ -136,6 +137,7 @@ def _configure_noise_and_k(args, train_loader) -> dict:
     sample_rate = 1.0 / float(logical_steps)
     train_size = int(len(train_loader.dataset))
     expected_batch_size = int(train_size * sample_rate)
+    planned_logical_steps = logical_steps * int(args.epochs)
     if expected_batch_size <= 0:
         raise ValueError("Expected logical batch size rounded to zero")
 
@@ -145,7 +147,7 @@ def _configure_noise_and_k(args, train_loader) -> dict:
                 target_epsilon=float(args.target_epsilon),
                 target_delta=float(args.delta),
                 sample_rate=sample_rate,
-                epochs=int(args.epochs),
+                steps=planned_logical_steps,
                 accountant=str(args.accountant),
                 epsilon_tolerance=float(args.epsilon_tolerance),
             )
@@ -153,7 +155,7 @@ def _configure_noise_and_k(args, train_loader) -> dict:
         print(
             f"[SlaClip] calibrated sigma={args.sigma:.12f} for "
             f"epsilon={args.target_epsilon:g}, delta={args.delta:g}, "
-            f"q_eff={sample_rate:.12f}, steps={logical_steps * int(args.epochs)}"
+            f"q_eff={sample_rate:.12f}, steps={planned_logical_steps}"
         )
     elif args.method != "nondp" and args.sigma is None:
         raise ValueError("A private run requires a fixed or calibrated sigma")
@@ -191,6 +193,7 @@ def _configure_noise_and_k(args, train_loader) -> dict:
 
     return {
         "logical_steps_per_epoch": logical_steps,
+        "planned_logical_steps": planned_logical_steps,
         "sample_rate": sample_rate,
         "expected_batch_size": expected_batch_size,
         "K_selection": k_metadata,
@@ -287,6 +290,66 @@ def _make_private(args, model, optimizer, criterion, train_loader):
     return privacy_engine, model, optimizer, criterion, train_loader
 
 
+def _validate_private_sampling_runtime(
+    *, args, privacy_engine, optimizer, train_loader, sampling_metadata: dict
+) -> dict:
+    """Fail before training if the sampler, optimizer, and accountant disagree."""
+
+    expected_steps = int(sampling_metadata["logical_steps_per_epoch"])
+    expected_rate = float(sampling_metadata["sample_rate"])
+    expected_batch_size = int(sampling_metadata["expected_batch_size"])
+    actual_steps = int(len(train_loader))
+
+    if privacy_engine is None:
+        if str(args.method) != "nondp":
+            raise RuntimeError("Private method was created without a PrivacyEngine")
+        if actual_steps != expected_steps:
+            raise RuntimeError(
+                f"Non-private loader length changed: {expected_steps} -> {actual_steps}"
+            )
+        return {
+            "runtime_logical_steps_per_epoch": actual_steps,
+            "sampler_sample_rate": None,
+            "accountant_sample_rate": None,
+            "optimizer_expected_batch_size": None,
+        }
+
+    sampler_rate = getattr(train_loader, "sample_rate", None)
+    accountant_rate = getattr(privacy_engine, "sample_rate", None)
+    optimizer_batch_size = getattr(optimizer, "expected_batch_size", None)
+    if sampler_rate is None or accountant_rate is None:
+        raise RuntimeError("Private loader/accountant did not expose its sample rate")
+    if optimizer_batch_size is None:
+        raise RuntimeError("DP optimizer did not expose expected_batch_size")
+
+    checks = {
+        "private loader logical steps": (actual_steps, expected_steps),
+        "Poisson sampler sample rate": (float(sampler_rate), expected_rate),
+        "accountant sample rate": (float(accountant_rate), expected_rate),
+        "optimizer expected batch size": (
+            int(optimizer_batch_size),
+            expected_batch_size,
+        ),
+    }
+    mismatches = []
+    for label, (actual, expected) in checks.items():
+        if isinstance(actual, float):
+            equal = math.isclose(actual, expected, rel_tol=0.0, abs_tol=0.0)
+        else:
+            equal = actual == expected
+        if not equal:
+            mismatches.append(f"{label}: expected {expected!r}, got {actual!r}")
+    if mismatches:
+        raise RuntimeError("Private sampling invariant failed: " + "; ".join(mismatches))
+
+    return {
+        "runtime_logical_steps_per_epoch": actual_steps,
+        "sampler_sample_rate": float(sampler_rate),
+        "accountant_sample_rate": float(accountant_rate),
+        "optimizer_expected_batch_size": int(optimizer_batch_size),
+    }
+
+
 def _get_clip_value(optimizer) -> float:
     for attribute in ("current_clip", "max_grad_norm"):
         value = getattr(optimizer, attribute, None)
@@ -303,6 +366,95 @@ def _get_epsilon(privacy_engine, delta: float) -> float:
     if privacy_engine is None:
         return float("nan")
     return float(privacy_engine.accountant.get_epsilon(delta=float(delta)))
+
+
+def _epsilon_at_steps(
+    *, accountant: str, sigma: float, sample_rate: float, steps: int, delta: float
+) -> float:
+    if int(steps) <= 0:
+        return 0.0
+    probe = create_accountant(mechanism=str(accountant))
+    probe.history = [(float(sigma), float(sample_rate), int(steps))]
+    return float(probe.get_epsilon(delta=float(delta)))
+
+
+def _compute_privacy_budget_guard(
+    *, args, privacy_engine, optimizer, sampling_metadata: dict
+) -> dict:
+    """Pre-compute the last release that stays at or below target epsilon."""
+
+    planned_steps = int(sampling_metadata["planned_logical_steps"])
+    mode = str(args.epsilon_mode)
+    enabled = (
+        privacy_engine is not None
+        and mode in {"calibrate", "hard-stop"}
+        and args.target_epsilon is not None
+    )
+    if not enabled:
+        return {
+            "enabled": False,
+            "planned_steps": planned_steps,
+            "max_compliant_steps": planned_steps,
+            "planned_epsilon": None,
+            "projected_next_epsilon": None,
+        }
+
+    sample_rate = float(privacy_engine.sample_rate)
+    sigma = float(getattr(optimizer, "noise_multiplier"))
+    target = float(args.target_epsilon)
+    common = {
+        "accountant": str(args.accountant),
+        "sigma": sigma,
+        "sample_rate": sample_rate,
+        "delta": float(args.delta),
+    }
+    planned_epsilon = _epsilon_at_steps(steps=planned_steps, **common)
+    if planned_epsilon <= target:
+        max_compliant_steps = planned_steps
+    else:
+        low, high = 0, planned_steps
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            if _epsilon_at_steps(steps=midpoint, **common) <= target:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        max_compliant_steps = low
+
+    truncated = planned_steps - max_compliant_steps
+    if mode == "calibrate" and truncated > 1:
+        raise RuntimeError(
+            "Calibrated privacy plan is inconsistent with the requested horizon: "
+            f"{truncated} releases would need to be removed "
+            f"(planned epsilon={planned_epsilon}, target={target})."
+        )
+    if max_compliant_steps <= 0 and planned_steps > 0:
+        raise RuntimeError("The first private release would exceed target epsilon")
+
+    projected_next = None
+    if max_compliant_steps < planned_steps:
+        projected_next = _epsilon_at_steps(
+            steps=max_compliant_steps + 1, **common
+        )
+        if not (
+            _epsilon_at_steps(steps=max_compliant_steps, **common)
+            <= target
+            < projected_next
+        ):
+            raise RuntimeError("Could not establish a strict privacy-budget boundary")
+
+    return {
+        "enabled": True,
+        "mode": mode,
+        "planned_steps": planned_steps,
+        "max_compliant_steps": int(max_compliant_steps),
+        "steps_truncated_by_plan": int(truncated),
+        "target_epsilon": target,
+        "planned_epsilon": float(planned_epsilon),
+        "projected_next_epsilon": projected_next,
+        "sample_rate": sample_rate,
+        "accountant_noise_multiplier": sigma,
+    }
 
 
 def _resolved_method_configuration(args, optimizer) -> dict:
@@ -446,9 +598,25 @@ def main() -> None:
     privacy_engine, model, optimizer, criterion, train_loader = _make_private(
         args, model, optimizer, criterion, train_loader
     )
+    sampling_metadata.update(
+        _validate_private_sampling_runtime(
+            args=args,
+            privacy_engine=privacy_engine,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            sampling_metadata=sampling_metadata,
+        )
+    )
     protocol_metadata["resolved_method"] = _resolved_method_configuration(
         args, optimizer
     )
+    privacy_budget_guard = _compute_privacy_budget_guard(
+        args=args,
+        privacy_engine=privacy_engine,
+        optimizer=optimizer,
+        sampling_metadata=sampling_metadata,
+    )
+    protocol_metadata["privacy_budget_guard_plan"] = privacy_budget_guard
 
     metadata = collect_run_metadata(
         args=args,
@@ -457,8 +625,7 @@ def main() -> None:
         opacus_root=_REPO_ROOT,
         slaclip_root=_THIS_DIR,
         device=device,
-        logical_steps_per_epoch=sampling_metadata["logical_steps_per_epoch"],
-        expected_batch_size=sampling_metadata["expected_batch_size"],
+        sampling_metadata=sampling_metadata,
     )
     write_config_json(config_path, metadata)
 
@@ -471,7 +638,9 @@ def main() -> None:
     }
     records: list[dict] = []
     cumulative_logical_steps = 0
-    hard_stop = args.epsilon_mode == "hard-stop"
+    budget_guard_enabled = bool(privacy_budget_guard["enabled"])
+    budget_step_cap = int(privacy_budget_guard["max_compliant_steps"])
+    planned_logical_steps = int(privacy_budget_guard["planned_steps"])
     clip_boundary_hits = {"min": 0, "max": 0}
 
     if privacy_engine is None:
@@ -505,10 +674,13 @@ def main() -> None:
                         abs_tol=1e-12,
                     ):
                         clip_boundary_hits["max"] += 1
-                if not hard_stop:
+                if not budget_guard_enabled:
                     return False
-                epsilon = float(info.get("epsilon", float("nan")))
-                return math.isfinite(epsilon) and epsilon >= float(args.target_epsilon)
+                global_step = cumulative_logical_steps + int(info["logical_step"])
+                return (
+                    budget_step_cap < planned_logical_steps
+                    and global_step >= budget_step_cap
+                )
 
             train_loss, train_accuracy, stopped_early, epoch_steps = train_one_epoch(
                 model=model,
@@ -521,6 +693,7 @@ def main() -> None:
                 delta=float(args.delta),
                 on_batch_end=on_logical_step,
                 expose_training_metrics=privacy_engine is None,
+                report_epsilon_on_step=False,
             )
             cumulative_logical_steps += int(epoch_steps)
 
@@ -597,6 +770,12 @@ def main() -> None:
         final_test_accuracy = records[-1]["test_accuracy"]
 
     actual_epsilon = _get_epsilon(privacy_engine, float(args.delta))
+    steps_truncated = max(0, planned_logical_steps - cumulative_logical_steps)
+    stopped_before_release = bool(
+        budget_guard_enabled
+        and steps_truncated > 0
+        and cumulative_logical_steps == budget_step_cap
+    )
     final = {
         "epochs_completed": int(len(records)),
         "logical_steps_completed": int(cumulative_logical_steps),
@@ -624,9 +803,16 @@ def main() -> None:
                 clip_boundary_hits["min"] or clip_boundary_hits["max"]
             ),
         },
+        "privacy_budget_guard": {
+            **privacy_budget_guard,
+            "completed_steps": int(cumulative_logical_steps),
+            "steps_truncated": int(steps_truncated),
+            "last_compliant_epsilon": actual_epsilon,
+            "stopped_before_release": stopped_before_release,
+        },
         "hard_stop_overshoot": (
             actual_epsilon - float(args.target_epsilon)
-            if hard_stop and math.isfinite(actual_epsilon)
+            if args.epsilon_mode == "hard-stop" and math.isfinite(actual_epsilon)
             else None
         ),
     }

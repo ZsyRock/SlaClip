@@ -39,7 +39,7 @@ def full_grid():
     return generate_main_candidates(SOURCE_GIT)
 
 
-def _resolved_method(candidate, sigma, K):
+def _resolved_method(candidate, sigma, K, expected_batch_size):
     method = candidate["group"]["method"]
     C0 = candidate["hyperparameters"]["C0"]
     classes = {
@@ -90,7 +90,7 @@ def _resolved_method(candidate, sigma, K):
                 "count_release_denominator": (
                     "expected_batch_size*accumulated_iterations"
                 ),
-                "count_release_expected_batch_size": 90,
+                "count_release_expected_batch_size": expected_batch_size,
                 "empty_poisson_count_release": True,
             }
         )
@@ -126,7 +126,10 @@ def _resolved_method(candidate, sigma, K):
 def _payload(candidate, accuracy, *, test_accuracy=None, dirty=False):
     configuration = copy.deepcopy(candidate["expected_configuration"])
     sigma = 1.23
-    expected_batch_size = 90
+    private_train_size = 2 * int(candidate["hyperparameters"]["batch_size"]) - 1
+    steps_per_epoch = 2
+    sample_rate = 1.0 / steps_per_epoch
+    expected_batch_size = int(private_train_size * sample_rate)
     K_max = paper_k_upper_bound(expected_batch_size, sigma)
     K = int(K_max)
     if candidate["group"]["method"] in {"slaclip", "slaclip-q"}:
@@ -147,13 +150,15 @@ def _payload(candidate, accuracy, *, test_accuracy=None, dirty=False):
         configuration["adap_count_noise_std"] = max(
             1.0, candidate["hyperparameters"]["batch_size"] / 20.0
         )
+    planned_steps = steps_per_epoch * PAPER_EPOCHS[candidate["group"]["dataset"]]
     epochs = [
         {
             "validation_accuracy": float(accuracy),
             "test_loss": None,
             "test_accuracy": None,
+            "logical_steps_completed": epoch * steps_per_epoch,
         }
-        for _ in range(PAPER_EPOCHS[candidate["group"]["dataset"]])
+        for epoch in range(1, PAPER_EPOCHS[candidate["group"]["dataset"]] + 1)
     ]
     git = {
         name: {
@@ -177,13 +182,24 @@ def _payload(candidate, accuracy, *, test_accuracy=None, dirty=False):
                     "selection_seed": 2026,
                 },
                 "K_selection": K_selection,
-                "resolved_method": _resolved_method(candidate, sigma, K),
+                "resolved_method": _resolved_method(
+                    candidate, sigma, K, expected_batch_size
+                ),
             },
             "git": git,
-            "sampling": {"expected_batch_size": expected_batch_size},
+            "sampling": {
+                "logical_steps_per_epoch": steps_per_epoch,
+                "runtime_logical_steps_per_epoch": steps_per_epoch,
+                "planned_logical_steps": planned_steps,
+                "effective_sample_rate": sample_rate,
+                "sampler_sample_rate": sample_rate,
+                "accountant_sample_rate": sample_rate,
+                "expected_batch_size": expected_batch_size,
+                "optimizer_expected_batch_size": expected_batch_size,
+            },
             "data": {
-                "official_train_size": 100,
-                "private_train_size": 90,
+                "official_train_size": private_train_size + 10,
+                "private_train_size": private_train_size,
                 "validation_size": 10,
                 "test_size": 0,
                 "selection_phase_test_loader_created": False,
@@ -198,6 +214,7 @@ def _payload(candidate, accuracy, *, test_accuracy=None, dirty=False):
         "epochs": epochs,
         "final": {
             "epochs_completed": len(epochs),
+            "logical_steps_completed": planned_steps,
             "epsilon": candidate["group"]["target_epsilon"],
             "delta": configuration["delta"],
             "target_epsilon": candidate["group"]["target_epsilon"],
@@ -206,6 +223,17 @@ def _payload(candidate, accuracy, *, test_accuracy=None, dirty=False):
             "final_validation_accuracy": float(accuracy),
             "final_test_loss": None,
             "final_test_accuracy": test_accuracy,
+            "privacy_budget_guard": {
+                "enabled": True,
+                "planned_steps": planned_steps,
+                "max_compliant_steps": planned_steps,
+                "planned_epsilon": candidate["group"]["target_epsilon"],
+                "projected_next_epsilon": None,
+                "completed_steps": planned_steps,
+                "steps_truncated": 0,
+                "last_compliant_epsilon": candidate["group"]["target_epsilon"],
+                "stopped_before_release": False,
+            },
         },
     }
 
@@ -377,6 +405,55 @@ def test_selection_rejects_final_sigma_disagreement(full_grid):
     payload["final"]["sigma"] = 1.24
     with pytest.raises(GridValidationError, match="configuration sigma"):
         select_best_candidates([candidate], {candidate["candidate_id"]: payload})
+
+
+def test_selection_accepts_only_a_proven_final_release_budget_fallback(full_grid):
+    candidate = next(
+        entry
+        for entry in full_grid
+        if entry["group"]["method"] == "vanilla-clip"
+        and entry["group"]["dataset"] == "mnist"
+    )
+    payload = _payload(candidate, 0.6)
+    target = float(candidate["group"]["target_epsilon"])
+    planned = int(payload["final"]["logical_steps_completed"])
+    actual = target - 0.05
+    projected = target + 0.001
+    payload["epochs"][-1]["logical_steps_completed"] = planned - 1
+    payload["final"]["logical_steps_completed"] = planned - 1
+    payload["final"]["epsilon"] = actual
+    payload["final"]["privacy_budget_guard"].update(
+        {
+            "max_compliant_steps": planned - 1,
+            "planned_epsilon": projected,
+            "projected_next_epsilon": projected,
+            "completed_steps": planned - 1,
+            "steps_truncated": 1,
+            "last_compliant_epsilon": actual,
+            "stopped_before_release": True,
+        }
+    )
+
+    retrains = select_best_candidates(
+        [candidate], {candidate["candidate_id"]: payload}
+    )
+    assert len(retrains) == 3
+
+    over_budget = copy.deepcopy(payload)
+    over_budget["final"]["epsilon"] = target + 1e-4
+    over_budget["final"]["privacy_budget_guard"]["last_compliant_epsilon"] = (
+        target + 1e-4
+    )
+    with pytest.raises(GridValidationError, match="exceeds target"):
+        select_best_candidates(
+            [candidate], {candidate["candidate_id"]: over_budget}
+        )
+
+    unproven = copy.deepcopy(payload)
+    unproven["final"]["privacy_budget_guard"]["projected_next_epsilon"] = target
+    unproven["final"]["privacy_budget_guard"]["planned_epsilon"] = target
+    with pytest.raises(GridValidationError, match="does not prove"):
+        select_best_candidates([candidate], {candidate["candidate_id"]: unproven})
 
 
 def test_resolved_metadata_reads_noise_and_clip_from_optimizer_instance(monkeypatch):

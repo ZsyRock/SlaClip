@@ -1,5 +1,6 @@
 import pytest
 
+from opacus.accountants import create_accountant
 from opacus.accountants.utils import get_noise_multiplier
 
 
@@ -100,8 +101,15 @@ def test_all_camera_ready_table2_noise_values(
         target_epsilon=epsilon,
         target_delta=delta,
         sample_rate=1.0 / logical_steps,
-        epochs=epochs,
+        steps=logical_steps * epochs,
         accountant="rdp",
         epsilon_tolerance=1e-5,
     )
     assert round(float(sigma), 3) == pytest.approx(paper_sigma_3dp)
+    accountant = create_accountant(mechanism="rdp")
+    accountant.history = [
+        (float(sigma), 1.0 / logical_steps, logical_steps * epochs)
+    ]
+    actual_epsilon = accountant.get_epsilon(delta=delta)
+    assert actual_epsilon <= epsilon
+    assert epsilon - actual_epsilon <= 1e-5

@@ -74,7 +74,7 @@ def retrain_id(candidate: Mapping[str, Any], seed: int) -> str:
     )
 
 
-def git_snapshot(repo: Path) -> dict[str, Any]:
+def git_snapshot(repo: Path, *, ignore_submodules: bool = False) -> dict[str, Any]:
     """Return the exact clean Git identity used to generate a manifest."""
 
     def run(*args: str) -> str:
@@ -93,7 +93,10 @@ def git_snapshot(repo: Path) -> dict[str, Any]:
         return completed.stdout.strip()
 
     commit = run("rev-parse", "HEAD")
-    status = run("status", "--porcelain=v1")
+    status_args = ["status", "--porcelain=v1"]
+    if ignore_submodules:
+        status_args.append("--ignore-submodules=all")
+    status = run(*status_args)
     if not commit:
         raise GridValidationError(f"Git repository {repo} has no HEAD commit")
     if status:
@@ -106,7 +109,9 @@ def git_snapshot(repo: Path) -> dict[str, Any]:
 def source_git_identity(*, slaclip_root: Path, opacus_root: Path) -> dict[str, Any]:
     return {
         "slaclip": git_snapshot(slaclip_root),
-        "opacus": git_snapshot(opacus_root),
+        # The nested SlaClip commit is tracked independently; do not require a
+        # parent Opacus commit merely to update that gitlink.
+        "opacus": git_snapshot(opacus_root, ignore_submodules=True),
     }
 
 
@@ -840,6 +845,123 @@ def _validate_resolved_method(
         )
 
 
+def _validate_private_horizon(
+    *,
+    metadata: Mapping[str, Any],
+    epochs: Sequence[Any],
+    final: Mapping[str, Any],
+    expected_configuration: Mapping[str, Any],
+    target_epsilon: float,
+    expected_epochs: int,
+    context: str,
+) -> None:
+    actual_epsilon = float(_need(final, "epsilon", f"{context}.final"))
+    tolerance = float(expected_configuration["epsilon_tolerance"])
+    if actual_epsilon > target_epsilon + 1e-12:
+        raise GridValidationError(
+            f"{context}.final.epsilon={actual_epsilon} exceeds target "
+            f"{target_epsilon}; calibration tolerance is not privacy slack"
+        )
+
+    sampling = _need_mapping(metadata, "sampling", f"{context}.metadata")
+    private_train_size = _need(
+        _need_mapping(metadata, "data", f"{context}.metadata"),
+        "private_train_size",
+        f"{context}.metadata.data",
+    )
+    batch_size = int(expected_configuration["batch_size"])
+    expected_steps_per_epoch = -(-int(private_train_size) // batch_size)
+    planned_steps = expected_steps_per_epoch * expected_epochs
+    expected_sample_rate = 1.0 / float(expected_steps_per_epoch)
+    expected_batch_size = int(int(private_train_size) * expected_sample_rate)
+    for key, expected in (
+        ("logical_steps_per_epoch", expected_steps_per_epoch),
+        ("runtime_logical_steps_per_epoch", expected_steps_per_epoch),
+        ("planned_logical_steps", planned_steps),
+        ("effective_sample_rate", expected_sample_rate),
+        ("sampler_sample_rate", expected_sample_rate),
+        ("accountant_sample_rate", expected_sample_rate),
+        ("expected_batch_size", expected_batch_size),
+        ("optimizer_expected_batch_size", expected_batch_size),
+    ):
+        if not _equal(_need(sampling, key, f"{context}.metadata.sampling"), expected):
+            raise GridValidationError(
+                f"{context}.metadata.sampling.{key} does not match the fixed "
+                "Poisson mechanism"
+            )
+
+    guard = _need_mapping(final, "privacy_budget_guard", f"{context}.final")
+    if _need(guard, "enabled", f"{context}.final.privacy_budget_guard") is not True:
+        raise GridValidationError(f"{context} did not enable the privacy-budget guard")
+    completed_steps = _need(final, "logical_steps_completed", f"{context}.final")
+    if type(completed_steps) is not int:
+        raise GridValidationError(f"{context}.final logical step count must be an integer")
+    steps_truncated = planned_steps - completed_steps
+    if steps_truncated not in (0, 1):
+        raise GridValidationError(
+            f"{context} completed {completed_steps}/{planned_steps} releases; only a "
+            "single final-release privacy fallback is admissible"
+        )
+    for key, expected in (
+        ("planned_steps", planned_steps),
+        ("completed_steps", completed_steps),
+        ("steps_truncated", steps_truncated),
+        ("max_compliant_steps", completed_steps),
+        ("last_compliant_epsilon", actual_epsilon),
+    ):
+        if not _equal(_need(guard, key, f"{context}.final.privacy_budget_guard"), expected):
+            raise GridValidationError(
+                f"{context}.final.privacy_budget_guard.{key} is inconsistent"
+            )
+
+    if steps_truncated == 0:
+        if target_epsilon - actual_epsilon > 2.0 * tolerance:
+            raise GridValidationError(
+                f"{context}.final.epsilon={actual_epsilon} is farther than the "
+                f"declared calibration tolerance from target {target_epsilon}"
+            )
+        if _need(
+            guard, "stopped_before_release", f"{context}.final.privacy_budget_guard"
+        ) is not False:
+            raise GridValidationError(f"{context} falsely reports a budget stop")
+        expected_epoch_steps = [
+            expected_steps_per_epoch * epoch for epoch in range(1, expected_epochs + 1)
+        ]
+    else:
+        projected_next = _need(
+            guard, "projected_next_epsilon", f"{context}.final.privacy_budget_guard"
+        )
+        if not _is_number(projected_next) or not target_epsilon < float(projected_next):
+            raise GridValidationError(
+                f"{context} does not prove that the omitted final release exceeded budget"
+            )
+        if _need(
+            guard, "stopped_before_release", f"{context}.final.privacy_budget_guard"
+        ) is not True:
+            raise GridValidationError(
+                f"{context} did not stop before the over-budget release"
+            )
+        if not _equal(
+            _need(guard, "planned_epsilon", f"{context}.final.privacy_budget_guard"),
+            projected_next,
+        ):
+            raise GridValidationError(
+                f"{context} projected final-release epsilon is inconsistent"
+            )
+        expected_epoch_steps = [
+            expected_steps_per_epoch * epoch for epoch in range(1, expected_epochs)
+        ] + [planned_steps - 1]
+
+    observed_epoch_steps = [
+        _need(epoch, "logical_steps_completed", f"{context}.epochs")
+        for epoch in epochs
+    ]
+    if observed_epoch_steps != expected_epoch_steps:
+        raise GridValidationError(
+            f"{context} epoch logical-step trajectory does not match its privacy horizon"
+        )
+
+
 def validate_selection_run(
     candidate: Mapping[str, Any], payload: Mapping[str, Any]
 ) -> tuple[float, str]:
@@ -933,14 +1055,15 @@ def validate_selection_run(
         final=final,
         context=context,
     )
-    actual_epsilon = float(final["epsilon"])
-    target_epsilon = float(canonical["group"]["target_epsilon"])
-    tolerance = float(canonical["expected_configuration"]["epsilon_tolerance"])
-    if abs(actual_epsilon - target_epsilon) > 2.0 * tolerance:
-        raise GridValidationError(
-            f"{context}.final.epsilon={actual_epsilon} is not within the declared "
-            f"calibration tolerance of target {target_epsilon}"
-        )
+    _validate_private_horizon(
+        metadata=metadata,
+        epochs=epochs,
+        final=final,
+        expected_configuration=canonical["expected_configuration"],
+        target_epsilon=float(canonical["group"]["target_epsilon"]),
+        expected_epochs=expected_epochs,
+        context=context,
+    )
 
     data_fingerprint = json.dumps(
         _need_mapping(metadata, "data", f"{context}.metadata"),
@@ -948,6 +1071,90 @@ def validate_selection_run(
         separators=(",", ":"),
     )
     return metric, data_fingerprint
+
+
+def validate_retrain_run(
+    record: Mapping[str, Any], payload: Mapping[str, Any]
+) -> tuple[float, float]:
+    """Validate one final three-seed run, including its exact DP horizon."""
+
+    context = f"retrain {_need(record, 'run_name', 'retrain record')}"
+    if _need(record, "record_type", context) != "main_retrain_run":
+        raise GridValidationError(f"{context} has an invalid record_type")
+    if _need(payload, "schema_version", context) != RUN_SCHEMA_VERSION:
+        raise GridValidationError(f"{context} has an unsupported run schema")
+    metadata = _need_mapping(payload, "metadata", context)
+    configuration = _need_mapping(metadata, "configuration", f"{context}.metadata")
+    expected_configuration = _need_mapping(record, "expected_configuration", context)
+    for key, expected in expected_configuration.items():
+        if not _equal(_need(configuration, key, f"{context}.configuration"), expected):
+            raise GridValidationError(f"{context} configuration mismatch for {key}")
+    protocol = _need_mapping(metadata, "protocol", f"{context}.metadata")
+    if _need(protocol, "protocol", f"{context}.metadata.protocol") != "main":
+        raise GridValidationError(f"{context} is not a main-protocol run")
+    if _need(protocol, "phase", f"{context}.metadata.protocol") != "retrain":
+        raise GridValidationError(f"{context} is not a retrain run")
+    _validate_run_git(metadata, record, context)
+
+    epochs = _need(payload, "epochs", context)
+    final = _need_mapping(payload, "final", context)
+    if not isinstance(epochs, list):
+        raise GridValidationError(f"{context}.epochs must be an array")
+    expected_epochs = int(expected_configuration["epochs"])
+    if len(epochs) != expected_epochs:
+        raise GridValidationError(f"{context} did not record {expected_epochs} epochs")
+    if _need(final, "epochs_completed", f"{context}.final") != expected_epochs:
+        raise GridValidationError(f"{context} did not complete the prescribed epochs")
+
+    data = _need_mapping(metadata, "data", f"{context}.metadata")
+    if _need(data, "validation_size", f"{context}.metadata.data") != 0:
+        raise GridValidationError(f"{context} unexpectedly created a validation split")
+    for index, epoch in enumerate(epochs, start=1):
+        epoch = _need_mapping({"epoch": epoch}, "epoch", f"{context}.epochs[{index}]")
+        for key in ("validation_loss", "validation_accuracy", "test_loss", "test_accuracy"):
+            if epoch.get(key) is not None:
+                raise GridValidationError(
+                    f"{context}.epochs[{index}] unexpectedly publishes {key}"
+                )
+    if final.get("final_validation_accuracy") is not None:
+        raise GridValidationError(f"{context} unexpectedly publishes validation accuracy")
+    test_accuracy = _need(final, "final_test_accuracy", f"{context}.final")
+    test_loss = _need(final, "final_test_loss", f"{context}.final")
+    if not _is_number(test_accuracy) or not math.isfinite(float(test_accuracy)):
+        raise GridValidationError(f"{context} has invalid final test accuracy")
+    if not 0.0 <= float(test_accuracy) <= 1.0:
+        raise GridValidationError(f"{context} final test accuracy is outside [0,1]")
+    if not _is_number(test_loss) or not math.isfinite(float(test_loss)) or float(test_loss) < 0:
+        raise GridValidationError(f"{context} has invalid final test loss")
+    if _need(final, "epsilon_mode", f"{context}.final") != "calibrate":
+        raise GridValidationError(f"{context} did not use calibrated epsilon mode")
+    for key in ("epsilon", "sigma"):
+        value = _need(final, key, f"{context}.final")
+        if not _is_number(value) or not math.isfinite(float(value)) or float(value) <= 0:
+            raise GridValidationError(f"{context}.final.{key} must be finite and positive")
+
+    canonical = {
+        "group": _need_mapping(record, "group", context),
+        "hyperparameters": _need_mapping(record, "hyperparameters", context),
+    }
+    _validate_resolved_method(
+        metadata=metadata,
+        protocol=protocol,
+        configuration=configuration,
+        canonical=canonical,
+        final=final,
+        context=context,
+    )
+    _validate_private_horizon(
+        metadata=metadata,
+        epochs=epochs,
+        final=final,
+        expected_configuration=expected_configuration,
+        target_epsilon=float(canonical["group"]["target_epsilon"]),
+        expected_epochs=expected_epochs,
+        context=context,
+    )
+    return float(test_accuracy), float(test_loss)
 
 
 def select_best_candidates(

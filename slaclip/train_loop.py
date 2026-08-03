@@ -51,6 +51,7 @@ def train_one_epoch(
     delta: float | None = None,
     on_batch_end=None,
     expose_training_metrics: bool = True,
+    report_epsilon_on_step: bool = True,
 ) -> Tuple[float, float, bool, int]:
     model.train()
     total_loss = 0.0
@@ -86,7 +87,11 @@ def train_one_epoch(
                     "epoch": int(epoch),
                     "physical_step": int(physical_step),
                     "logical_step": int(logical_steps),
-                    "epsilon": current_epsilon(),
+                    "epsilon": (
+                        current_epsilon()
+                        if report_epsilon_on_step
+                        else float("nan")
+                    ),
                     "batch_acc": (
                         float(batch_acc)
                         if expose_training_metrics

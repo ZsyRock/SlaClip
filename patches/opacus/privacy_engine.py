@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import os
 import warnings
 from itertools import chain
@@ -474,13 +475,52 @@ class PrivacyEngine:
         if poisson_sampling:
             module.forbid_grad_accumulation()
 
+        # Freeze the logical Poisson mechanism before converting the ordinary
+        # DataLoader.  Upstream's sampler defaults to ``int(1 / sample_rate)``;
+        # for values such as q=1/211 the floating-point reciprocal is
+        # 210.999..., which would silently shorten every epoch and then make the
+        # accountant use q=1/210.  The paper protocol instead fixes
+        # q=1/ceil(N/B) and exactly ceil(N/B) releases per epoch.
+        requested_logical_steps = int(len(data_loader))
+        if requested_logical_steps <= 0:
+            raise ValueError("data_loader must contain at least one logical step")
+        requested_sample_rate = 1.0 / float(requested_logical_steps)
+
         data_loader = self._prepare_data_loader(
             data_loader,
             distributed=distributed,
             poisson_sampling=poisson_sampling,
         )
 
-        sample_rate = 1 / len(data_loader)
+        if poisson_sampling:
+            sampler = getattr(data_loader, "batch_sampler", None)
+            sampler_rate = getattr(sampler, "sample_rate", None)
+            if sampler_rate is None or not math.isclose(
+                float(sampler_rate),
+                requested_sample_rate,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "Poisson loader sample rate changed during conversion: "
+                    f"expected {requested_sample_rate!r}, got {sampler_rate!r}"
+                )
+            if hasattr(sampler, "steps"):
+                sampler.steps = requested_logical_steps
+            elif hasattr(sampler, "num_batches"):
+                sampler.num_batches = requested_logical_steps
+            else:
+                raise RuntimeError(
+                    "Poisson batch sampler does not expose a logical-step count"
+                )
+            if int(len(data_loader)) != requested_logical_steps:
+                raise RuntimeError(
+                    "Could not freeze Poisson logical steps: "
+                    f"expected {requested_logical_steps}, got {len(data_loader)}"
+                )
+            sample_rate = requested_sample_rate
+        else:
+            sample_rate = 1.0 / float(len(data_loader))
         expected_batch_size = int(len(data_loader.dataset) * sample_rate)
 
         if distributed and torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -543,7 +583,11 @@ class PrivacyEngine:
         Tuple[GradSampleModule, DPOptimizer, DataLoader],
         Tuple[GradSampleModule, DPOptimizer, DPLossFastGradientClipping, DataLoader],
     ]:
-        sample_rate = 1 / len(data_loader)
+        logical_steps = int(len(data_loader))
+        if logical_steps <= 0:
+            raise ValueError("data_loader must contain at least one logical step")
+        sample_rate = 1.0 / float(logical_steps)
+        total_steps = logical_steps * int(epochs)
 
         if len(self.accountant) > 0:
             warnings.warn(
@@ -562,7 +606,7 @@ class PrivacyEngine:
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
                 sample_rate=sample_rate,
-                epochs=epochs,
+                steps=total_steps,
                 accountant=self.accountant.mechanism(),
                 epsilon_tolerance=float(epsilon_tolerance),
             ),
